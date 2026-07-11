@@ -1,0 +1,46 @@
+[Unit]
+Description=Private Telegram Agent Bridge (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alex
+Group=alex
+WorkingDirectory=/home/alex
+Environment=HOME=/home/alex
+Environment=USER=alex
+Environment=LOGNAME=alex
+Environment=PATH=/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/telegram-agent/%i.env
+ExecStart=/usr/bin/python3 /usr/local/lib/codex-telegram-bridge/agent_bridge.py --backend %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=70
+KillMode=mixed
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/alex /var/lib/telegram-agent/%i /var/lib/codex-telegram-bridge
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+MemoryMax=4G
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
