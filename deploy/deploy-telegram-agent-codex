@@ -1,0 +1,94 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# -ne 0 || "$(id -u)" -ne 0 ]]; then
+    echo "This fixed deploy helper takes no arguments and must run as root." >&2
+    exit 2
+fi
+
+exec 9>/run/telegram-agent-deploy-codex.lock
+flock -n 9 || { echo "A Codex bridge deployment is already running." >&2; exit 1; }
+
+source_dir=/home/alex/codex-telegram-bridge
+runtime_dir=/usr/local/lib/codex-telegram-bridge
+service=telegram-agent@codex.service
+delay_seconds=30
+files=(bridge.py agent_bridge.py bridge_payload_mcp.py setup_bot.py response_schema.json)
+
+work_dir="$(mktemp -d /run/telegram-agent-deploy-codex.XXXXXX)"
+trap 'rm -rf "$work_dir"' EXIT
+before="$work_dir/source.before"
+after="$work_dir/source.after"
+backup="$work_dir/backup"
+staged="$work_dir/staged"
+mkdir -m 0700 "$backup" "$staged"
+
+for name in "${files[@]}" tests/test_bridge.py tests/test_agent_bridge.py tests/test_bridge_payload_mcp.py tests/test_deploy_gate.py telegram-agent@.service; do
+    path="$source_dir/$name"
+    [[ -f "$path" && ! -L "$path" ]] || { echo "Required source file is missing or unsafe: $name" >&2; exit 1; }
+done
+
+(cd "$source_dir" && sha256sum "${files[@]}" tests/test_bridge.py tests/test_agent_bridge.py tests/test_bridge_payload_mcp.py tests/test_deploy_gate.py) >"$before"
+
+systemctl start telegram-agent-validate-codex.service
+
+(cd "$source_dir" && sha256sum "${files[@]}" tests/test_bridge.py tests/test_agent_bridge.py tests/test_bridge_payload_mcp.py tests/test_deploy_gate.py) >"$after"
+cmp -s "$before" "$after" || { echo "Source changed during validation; deployment aborted." >&2; exit 1; }
+
+for name in "${files[@]}"; do
+    cp --no-dereference "$source_dir/$name" "$staged/$name"
+done
+(cd "$staged" && sha256sum "${files[@]}") >"$work_dir/staged.hash"
+head -n "${#files[@]}" "$before" >"$work_dir/application.hash"
+cmp -s "$work_dir/application.hash" "$work_dir/staged.hash" || {
+    echo "Source changed while creating the deployment snapshot; deployment aborted." >&2
+    exit 1
+}
+
+mkdir -p "$runtime_dir"
+for name in "${files[@]}"; do
+    if [[ -e "$runtime_dir/$name" ]]; then
+        cp -a "$runtime_dir/$name" "$backup/$name"
+    else
+        : >"$backup/$name.absent"
+    fi
+done
+
+rollback() {
+    echo "Deployment verification failed; restoring the previous runtime." >&2
+    for name in "${files[@]}"; do
+        if [[ -f "$backup/$name.absent" ]]; then
+            rm -f "$runtime_dir/$name"
+        else
+            install -o root -g root -m 0755 "$backup/$name" "$runtime_dir/$name"
+        fi
+    done
+    chmod 0644 "$runtime_dir/response_schema.json"
+    systemctl restart "$service" || true
+}
+
+for name in bridge.py agent_bridge.py bridge_payload_mcp.py setup_bot.py; do
+    install -o root -g root -m 0755 "$staged/$name" "$runtime_dir/$name"
+done
+install -o root -g root -m 0644 "$staged/response_schema.json" "$runtime_dir/response_schema.json"
+
+sleep "$delay_seconds"
+if ! systemctl restart "$service"; then
+    rollback
+    exit 1
+fi
+
+stable_checks=0
+for _ in {1..20}; do
+    if systemctl is-active --quiet "$service"; then
+        stable_checks=$((stable_checks + 1))
+        if [[ "$stable_checks" -ge 5 ]]; then
+            exit 0
+        fi
+    else
+        stable_checks=0
+    fi
+    sleep 1
+done
+rollback
+exit 1

@@ -10,9 +10,11 @@ This project is intentionally opinionated for a single-user VPS. It uses Telegra
 - Private-chat allowlist configured by the required `TELEGRAM_ALLOWED_USER_ID` environment variable.
 - Resumable backend sessions with per-instance SQLite metadata.
 - Text, photo, and document input up to 20 MB.
-- Generated-image delivery from constrained backend-owned directories.
+- Generated-image delivery through a turn-scoped stdio MCP payload, with multiple photos supported.
 - `/confirm` and `/deny` flow for externally mutating connector actions.
 - Process-group cancellation, typing indicators, retry backoff, and sanitized logs.
+- Ordinary Codex final messages remain plain text; transport metadata is kept out of the reply. Legacy resumed sessions are narrowly unwrapped from the former bridge schema.
+- Each backend sends a best-effort `<Backend> bridge is online.` message after successful startup.
 - Python standard library only.
 
 ## Architecture
@@ -26,6 +28,8 @@ telegram-agent@codex.service       telegram-agent@grok.service
        |                                  |
 SQLite state and uploads           SQLite state and uploads
 ```
+
+For Codex turns, the bridge launches the bundled `bridge_payload_mcp.py` server over stdio. The tool atomically replaces one turn-tagged `payload.json`; after Codex exits, the bridge validates and consumes it once. Image paths never depend on scraping tool output or final-message JSON.
 
 The instances share root-owned runtime files under `/usr/local/lib/codex-telegram-bridge` but use separate environment files, databases, upload paths, CLI sessions, and Telegram tokens.
 
@@ -95,6 +99,22 @@ Legacy single-instance scripts remain for migration compatibility. See `INSTANCE
 - `/deny` discards the pending external action.
 - `/help` shows command help.
 
+## Controlled self-deployment
+
+A one-time privileged bootstrap installs a root-owned, no-argument deploy helper, a hardened oneshot unit, and a PolicyKit rule allowing only user `alex` to start that exact unit:
+
+```bash
+sudo ./install_deploy_gate.sh
+```
+
+After bootstrap, an agent running as `alex` can validate, snapshot, deploy, and schedule a delayed Codex-only restart without sudo:
+
+```bash
+systemctl --no-block start telegram-agent-deploy-codex.service
+```
+
+The helper never executes a repository installer as root and never copies user-editable unit files. It deploys only an explicit application-file allowlist, aborts if source changes during validation or staging, and restores the previous runtime if restart verification fails. Grok and Hermes are outside its scope.
+
 ## Operations
 
 ```bash
@@ -109,7 +129,7 @@ Restart only the instance whose source, configuration, or authentication changed
 ## Development and validation
 
 ```bash
-python3 -m py_compile bridge.py agent_bridge.py setup_bot.py tests/test_bridge.py tests/test_agent_bridge.py
+python3 -m py_compile bridge.py agent_bridge.py bridge_payload_mcp.py setup_bot.py tests/test_bridge.py tests/test_agent_bridge.py tests/test_bridge_payload_mcp.py tests/test_deploy_gate.py
 python3 -m unittest discover -s tests -v
 systemd-analyze verify telegram-agent@.service
 python3 -m json.tool response_schema.json >/dev/null

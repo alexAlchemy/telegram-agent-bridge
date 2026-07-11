@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# -ne 0 || "$(id -u)" -ne 1000 ]]; then
+    echo "This fixed validator takes no arguments and must run as alex." >&2
+    exit 2
+fi
+
+source_dir=/home/alex/codex-telegram-bridge
+pycache="$(mktemp -d)"
+trap 'rm -rf "$pycache"' EXIT
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPYCACHEPREFIX="$pycache"
+
+cd "$source_dir"
+python3 -m py_compile bridge.py agent_bridge.py bridge_payload_mcp.py setup_bot.py tests/test_bridge.py tests/test_agent_bridge.py tests/test_bridge_payload_mcp.py tests/test_deploy_gate.py
+python3 -m unittest discover -s tests -v
+systemd-analyze verify telegram-agent@.service
+python3 -m json.tool response_schema.json >/dev/null

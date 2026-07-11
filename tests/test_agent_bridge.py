@@ -16,6 +16,7 @@ from agent_bridge import (  # noqa: E402
     GrokRunner,
     extract_grok_image_paths,
     load_instance_config,
+    send_startup_notification,
 )
 from bridge import CodexResult, MAX_OUTBOUND_IMAGE_BYTES, StateDB  # noqa: E402
 
@@ -37,6 +38,13 @@ class FakeRunner:
 
     async def run(self, prompt, thread_id, image_path=None):
         return CodexResult(True, "ok", thread_id="session-1")
+
+
+class StartupNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backend_online_message(self):
+        telegram = FakeTelegram()
+        await send_startup_notification(telegram, 99, "codex")
+        self.assertEqual(telegram.messages, [(99, "Codex bridge is online.")])
 
 
 class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):

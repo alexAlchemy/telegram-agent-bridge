@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -63,6 +64,19 @@ additional mutations into a confirmed action.
 Always return the requested output-schema object. Put the user-facing response in reply. For
 ordinary replies set confirmation_required=false and confirmation_summary=null.
 """.strip()
+
+CODEX_DEVELOPER_INSTRUCTIONS = DEVELOPER_INSTRUCTIONS.replace(
+    "Always return the requested output-schema object. Put the user-facing response in reply. For\n"
+    "ordinary replies set confirmation_required=false and confirmation_summary=null.",
+    "Return the user-facing response as ordinary text. For Telegram photos or external-action "
+    "confirmation metadata, call telegram_bridge.set_payload. Include every photo path in the "
+    "attachments array. Never perform an external mutation until a later authorized /confirm turn."
+).replace(
+    "On the first turn, do not perform the mutation. Return confirmation_required=true\n"
+    "and a precise confirmation_summary describing the single proposed change.",
+    "On the first turn, do not perform the mutation. Call telegram_bridge.set_payload with "
+    "confirmation required and a precise summary of the single proposed change."
+)
 
 
 class BridgeError(RuntimeError):
@@ -286,14 +300,18 @@ class CodexRunner:
         workspace: Path,
         schema_path: Path,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        payload_file: Path | None = None,
+        mcp_server_path: Path | None = None,
     ) -> None:
         self.binary = binary
         self.workspace = workspace
         self.schema_path = schema_path
         self.timeout_seconds = timeout_seconds
+        self.payload_file = payload_file
+        self.mcp_server_path = mcp_server_path
         self.process: asyncio.subprocess.Process | None = None
 
-    def _environment(self) -> dict[str, str]:
+    def _environment(self, turn_id: str | None = None) -> dict[str, str]:
         environment = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
         environment.setdefault("HOME", str(Path.home()))
         environment.setdefault("USER", "alex")
@@ -301,6 +319,9 @@ class CodexRunner:
         environment.setdefault(
             "PATH", "/usr/local/bin:/usr/bin:/bin:/home/alex/.local/bin"
         )
+        if turn_id and self.payload_file:
+            environment["TELEGRAM_BRIDGE_TURN_ID"] = turn_id
+            environment["TELEGRAM_BRIDGE_PAYLOAD_FILE"] = str(self.payload_file)
         return environment
 
     def build_argv(
@@ -316,7 +337,7 @@ class CodexRunner:
             str(self.workspace),
             "--search",
             "-c",
-            f"developer_instructions={json.dumps(DEVELOPER_INSTRUCTIONS)}",
+            f"developer_instructions={json.dumps(CODEX_DEVELOPER_INSTRUCTIONS)}",
             "exec",
         ]
         if thread_id:
@@ -325,10 +346,13 @@ class CodexRunner:
             [
                 "--json",
                 "--skip-git-repo-check",
-                "--output-schema",
-                str(self.schema_path),
             ]
         )
+        if self.mcp_server_path:
+            argv[1:1] = [
+                "-c", 'mcp_servers.telegram_bridge.command="/usr/bin/python3"',
+                "-c", f"mcp_servers.telegram_bridge.args={json.dumps([str(self.mcp_server_path)])}",
+            ]
         if image_path:
             argv.extend(["-i", str(image_path)])
         if thread_id:
@@ -356,11 +380,15 @@ class CodexRunner:
             return CodexResult(False, "", error="Codex is already running")
 
         argv = self.build_argv(thread_id, image_path)
+        turn_id = secrets.token_hex(16) if self.payload_file else None
+        if self.payload_file:
+            self.payload_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.payload_file.unlink(missing_ok=True)
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=self.workspace,
-                env=self._environment(),
+                env=self._environment(turn_id),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -389,6 +417,14 @@ class CodexRunner:
                 )
             if not parsed.success:
                 return parsed
+            if self.payload_file and turn_id:
+                try:
+                    images, required, summary = consume_bridge_payload(self.payload_file, turn_id)
+                except BridgeError:
+                    return CodexResult(False, "", thread_id=parsed.thread_id, error="Codex returned invalid Telegram payload metadata")
+                parsed.generated_images = images
+                parsed.confirmation_required = required
+                parsed.confirmation_summary = summary
             return parsed
         except FileNotFoundError:
             return CodexResult(False, "", error="Codex executable was not found")
@@ -397,6 +433,8 @@ class CodexRunner:
             return CodexResult(False, "", error="Codex process could not be started")
         finally:
             self.process = None
+            if self.payload_file:
+                self.payload_file.unlink(missing_ok=True)
 
     async def _read_stdout(
         self, stream: asyncio.StreamReader | None
@@ -407,16 +445,12 @@ class CodexRunner:
         final_text: str | None = None
         usage: dict[str, Any] | None = None
         failed = False
-        generated_images: list[Path] = []
         async for raw_line in stream:
             try:
                 event = json.loads(raw_line)
             except json.JSONDecodeError:
                 continue
             event_type = event.get("type")
-            for image_path in extract_generated_image_paths(event):
-                if image_path not in generated_images:
-                    generated_images.append(image_path)
             if event_type == "thread.started":
                 value = event.get("thread_id")
                 if isinstance(value, str):
@@ -433,31 +467,9 @@ class CodexRunner:
         if failed and final_text is None:
             return CodexResult(False, "", thread_id=thread_id, error="Codex reported a failed turn")
         if final_text is None:
-            return CodexResult(False, "", thread_id=thread_id, error="Codex returned no final reply")
-        try:
-            payload = json.loads(final_text)
-            reply = payload["reply"]
-            confirmation_required = bool(payload["confirmation_required"])
-            confirmation_summary = payload.get("confirmation_summary")
-            if not isinstance(reply, str):
-                raise TypeError
-            if confirmation_required and not isinstance(confirmation_summary, str):
-                raise TypeError
-            if not confirmation_required:
-                confirmation_summary = None
-        except (json.JSONDecodeError, KeyError, TypeError):
-            return CodexResult(
-                False, "", thread_id=thread_id, error="Codex returned an invalid structured reply"
-            )
-        return CodexResult(
-            True,
-            reply,
-            thread_id=thread_id,
-            confirmation_required=confirmation_required,
-            confirmation_summary=confirmation_summary,
-            usage=usage,
-            generated_images=tuple(generated_images),
-        )
+            final_text = ""
+        reply, required, summary = normalize_legacy_codex_reply(final_text)
+        return CodexResult(True, reply, thread_id=thread_id, confirmation_required=required, confirmation_summary=summary, usage=usage)
 
     async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> None:
         if stream is None:
@@ -677,6 +689,69 @@ class Bridge:
             with contextlib.suppress(TelegramError):
                 await self.telegram.send_typing(chat_id)
             await asyncio.sleep(4.5)
+
+
+def normalize_legacy_codex_reply(text: str) -> tuple[str, bool, str | None]:
+    """Unwrap only the bridge exact former output-schema object."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text, False, None
+    expected = {"reply", "confirmation_required", "confirmation_summary"}
+    if not isinstance(payload, dict) or set(payload) != expected:
+        return text, False, None
+    reply = payload.get("reply")
+    required = payload.get("confirmation_required")
+    summary = payload.get("confirmation_summary")
+    if not isinstance(reply, str) or not isinstance(required, bool):
+        return text, False, None
+    if required:
+        if not isinstance(summary, str) or not summary.strip():
+            return text, False, None
+        return reply, True, summary.strip()
+    if summary is not None:
+        return text, False, None
+    return reply, False, None
+
+
+def consume_bridge_payload(payload_file: Path, turn_id: str) -> tuple[tuple[Path, ...], bool, str | None]:
+    """Consume the single atomic MCP payload for exactly one Codex turn."""
+    if not payload_file.exists():
+        return (), False, None
+    try:
+        if payload_file.stat().st_size > 64 * 1024:
+            raise BridgeError("Telegram payload is too large")
+        payload = json.loads(payload_file.read_text())
+        if not isinstance(payload, dict) or payload.get("turn_id") != turn_id:
+            raise BridgeError("Telegram payload turn mismatch")
+        attachments = payload.get("attachments", [])
+        if not isinstance(attachments, list) or len(attachments) > 10:
+            raise BridgeError("Telegram payload attachments are invalid")
+        images: list[Path] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict) or attachment.get("kind") != "photo":
+                raise BridgeError("Telegram payload attachment is invalid")
+            path = attachment.get("path")
+            if not isinstance(path, str):
+                raise BridgeError("Telegram payload path is invalid")
+            accepted = extract_generated_image_paths(path)
+            if len(accepted) != 1 or accepted[0] != Path(path).resolve():
+                raise BridgeError("Telegram payload image is outside the trusted root")
+            if accepted[0] not in images:
+                images.append(accepted[0])
+        confirmation = payload.get("confirmation")
+        if confirmation is None:
+            return tuple(images), False, None
+        if not isinstance(confirmation, dict) or confirmation.get("required") is not True:
+            raise BridgeError("Telegram payload confirmation is invalid")
+        summary = confirmation.get("summary")
+        if not isinstance(summary, str) or not summary.strip() or len(summary) > 2000:
+            raise BridgeError("Telegram payload confirmation summary is invalid")
+        return tuple(images), True, summary.strip()
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BridgeError("Telegram payload could not be read") from exc
+    finally:
+        payload_file.unlink(missing_ok=True)
 
 
 def extract_generated_image_paths(value: Any) -> list[Path]:

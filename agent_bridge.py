@@ -492,6 +492,13 @@ def load_instance_config(backend: str) -> dict[str, Any]:
     }
 
 
+async def send_startup_notification(telegram: TelegramClient, chat_id: int, backend: str) -> None:
+    try:
+        await telegram.send_message(chat_id, f"{backend.title()} bridge is online.")
+    except TelegramError:
+        logging.warning("%s startup notification failed", backend)
+
+
 async def async_main() -> None:
     backend = parse_args().backend
     config = load_instance_config(backend)
@@ -505,6 +512,8 @@ async def async_main() -> None:
             config["workspace"],
             config["schema_path"],
             config["timeout_seconds"],
+            config["upload_root"].parent / "payload.json",
+            Path(__file__).resolve().parent / "bridge_payload_mcp.py",
         )
     else:
         runner = GrokRunner(
@@ -524,6 +533,7 @@ async def async_main() -> None:
         backend_name=backend,
     )
     cleanup_upload_root(config["upload_root"])
+    await send_startup_notification(telegram, config["allowed_user_id"], backend)
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):

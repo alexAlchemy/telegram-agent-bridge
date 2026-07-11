@@ -21,6 +21,7 @@ from bridge import (  # noqa: E402
     TelegramClient,
     get_attachment,
     parse_command,
+    normalize_legacy_codex_reply,
     sanitize_filename,
     split_message,
 )
@@ -69,6 +70,16 @@ class FakeRunner:
 
 
 class HelperTests(unittest.TestCase):
+    def test_legacy_bridge_json_is_unwrapped_narrowly(self):
+        legacy = json.dumps({
+            "reply": "hello",
+            "confirmation_required": False,
+            "confirmation_summary": None,
+        })
+        self.assertEqual(normalize_legacy_codex_reply(legacy), ("hello", False, None))
+        arbitrary = json.dumps({"reply": "data", "extra": True})
+        self.assertEqual(normalize_legacy_codex_reply(arbitrary), (arbitrary, False, None))
+
     def test_sanitize_filename_blocks_traversal(self):
         self.assertEqual(sanitize_filename("../../hello world.txt"), "hello_world.txt")
         self.assertEqual(sanitize_filename("..."), "attachment")
@@ -144,6 +155,20 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/tmp/image.png", resumed)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", new)
 
+    def test_mcp_is_scoped_per_invocation_without_output_schema(self):
+        root = Path(self.temp.name)
+        runner = CodexRunner(
+            "/usr/local/bin/codex", Path("/home/alex"), self.schema, 10,
+            root / "payload.json", root / "bridge_payload_mcp.py",
+        )
+        argv = runner.build_argv(None)
+        self.assertNotIn("--output-schema", argv)
+        self.assertTrue(any("mcp_servers.telegram_bridge.command" in item for item in argv))
+        self.assertTrue(any("bridge_payload_mcp.py" in item for item in argv))
+        environment = runner._environment("turn-123")
+        self.assertEqual(environment["TELEGRAM_BRIDGE_TURN_ID"], "turn-123")
+        self.assertEqual(environment["TELEGRAM_BRIDGE_PAYLOAD_FILE"], str(root / "payload.json"))
+
     def test_environment_excludes_telegram_token(self):
         with mock.patch.dict(
             os.environ,
@@ -162,8 +187,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "import json, sys\n"
             "sys.stdin.read()\n"
             "print(json.dumps({'type':'thread.started','thread_id':'abc'}))\n"
-            "payload={'reply':'hello','confirmation_required':False,'confirmation_summary':None}\n"
-            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(payload)}}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'hello'}}))\n"
             "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':3,'output_tokens':2}}))\n"
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
@@ -174,33 +198,59 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.thread_id, "abc")
         self.assertEqual(result.usage["output_tokens"], 2)
 
-    async def test_generated_image_path_is_captured(self):
+    async def test_subprocess_consumes_turn_scoped_payload(self):
+        root = Path(self.temp.name)
         generated_parent = Path.home() / ".codex" / "generated_images"
         generated_parent.mkdir(parents=True, exist_ok=True)
-        generated_root = Path(tempfile.mkdtemp(prefix="bridge-test-", dir=generated_parent))
-        image = generated_root / "result.png"
-        image.write_bytes(b"png")
-        self.addCleanup(lambda: generated_root.rmdir())
-        self.addCleanup(lambda: image.unlink(missing_ok=True))
+        with tempfile.TemporaryDirectory(prefix="runner-payload-", dir=generated_parent) as directory:
+            image = Path(directory) / "result.png"
+            image.write_bytes(b"png")
+            executable = root / "fake-payload-codex"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "sys.stdin.read()\n"
+                "payload={"
+                "'turn_id':os.environ['TELEGRAM_BRIDGE_TURN_ID'],"
+                "'attachments':[{'kind':'photo','path':" + repr(str(image)) + "}],"
+                "'confirmation':None}\n"
+                "pathlib.Path(os.environ['TELEGRAM_BRIDGE_PAYLOAD_FILE']).write_text(json.dumps(payload))\n"
+                "print(json.dumps({'type':'thread.started','thread_id':'abc'}))\n"
+                "print(json.dumps({'type':'turn.completed','usage':{}}))\n"
+            )
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            runner = CodexRunner(str(executable), Path("/home/alex"), self.schema, 10, root / "payload.json", root / "mcp.py")
+            result = await runner.run("test", None)
+            self.assertTrue(result.success)
+            self.assertEqual(result.generated_images, (image.resolve(),))
+            self.assertFalse((root / "payload.json").exists())
+
+    async def test_incidental_image_path_is_not_transport_metadata(self):
         reader = asyncio.StreamReader()
-        event = {"type": "item.completed", "item": {"type": "tool_call", "output": f"saved to {image}"}}
-        payload = {"reply": "", "confirmation_required": False, "confirmation_summary": None}
+        event = {"type": "item.completed", "item": {"type": "tool_call", "output": "saved to /home/alex/.codex/generated_images/example.png"}}
         reader.feed_data((json.dumps(event) + "\n").encode())
-        reader.feed_data((json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(payload)}}) + "\n").encode())
+        reader.feed_data((json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n").encode())
         reader.feed_eof()
         result = await self.runner._read_stdout(reader)
         self.assertTrue(result.success)
-        self.assertEqual(result.generated_images, (image.resolve(),))
+        self.assertEqual(result.reply, "done")
+        self.assertEqual(result.generated_images, ())
 
-    async def test_invalid_structured_output_fails_closed(self):
+    async def test_no_final_message_can_be_completed_by_payload(self):
         reader = asyncio.StreamReader()
-        reader.feed_data(
-            (json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "nope"}}) + "\n").encode()
-        )
+        reader.feed_data((json.dumps({"type": "turn.completed", "usage": {}}) + "\n").encode())
         reader.feed_eof()
         result = await self.runner._read_stdout(reader)
-        self.assertFalse(result.success)
-        self.assertIn("invalid structured reply", result.error)
+        self.assertTrue(result.success)
+        self.assertEqual(result.reply, "")
+
+    async def test_plain_final_message_is_accepted(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data((json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "nope"}}) + "\n").encode())
+        reader.feed_eof()
+        result = await self.runner._read_stdout(reader)
+        self.assertTrue(result.success)
+        self.assertEqual(result.reply, "nope")
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
