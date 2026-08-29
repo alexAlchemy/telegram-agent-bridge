@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bridge import (  # noqa: E402
     Bridge,
     BridgeError,
+    CgroupMemory,
     CodexResult,
     CodexRunner,
     MAX_FILE_BYTES,
@@ -24,6 +27,8 @@ from bridge import (  # noqa: E402
     normalize_legacy_codex_reply,
     sanitize_filename,
     split_message,
+    read_cgroup_memory,
+    iter_subprocess_lines,
 )
 
 
@@ -70,6 +75,33 @@ class FakeRunner:
 
 
 class HelperTests(unittest.TestCase):
+    def test_oversized_subprocess_event_is_drained_and_skipped(self):
+        async def collect():
+            reader = asyncio.StreamReader(limit=16)
+            reader.feed_data(b"x" * 40 + b"\n" + b"{\"ok\": true}\n")
+            reader.feed_eof()
+            return [line async for line in iter_subprocess_lines(reader)]
+
+        self.assertEqual(asyncio.run(collect()), [b"{\"ok\": true}\n"])
+
+    def test_reads_cgroup_v2_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = root / "proc-cgroup"
+            group = root / "service"
+            group.mkdir()
+            proc.write_text("0::/service\n")
+            (group / "memory.current").write_text("300\n")
+            (group / "memory.stat").write_text("anon 20\nfile 250\n")
+            self.assertEqual(
+                read_cgroup_memory(proc, root), CgroupMemory(300, 20, 250)
+            )
+
+    def test_formats_utc_timestamp_with_milliseconds(self):
+        from bridge import format_utc_timestamp
+
+        self.assertEqual(format_utc_timestamp(0.125), "1970-01-01T00:00:00.125Z")
+
     def test_legacy_bridge_json_is_unwrapped_narrowly(self):
         legacy = json.dumps({
             "reply": "hello",
@@ -165,6 +197,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--output-schema", argv)
         self.assertTrue(any("mcp_servers.telegram_bridge.command" in item for item in argv))
         self.assertTrue(any("bridge_payload_mcp.py" in item for item in argv))
+        self.assertTrue(any("mcp_servers.telegram_bridge.env_vars" in item for item in argv))
         environment = runner._environment("turn-123")
         self.assertEqual(environment["TELEGRAM_BRIDGE_TURN_ID"], "turn-123")
         self.assertEqual(environment["TELEGRAM_BRIDGE_PAYLOAD_FILE"], str(root / "payload.json"))
@@ -273,6 +306,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         return {
             "update_id": 1,
             "message": {
+                "message_id": 55,
                 "from": {"id": user},
                 "chat": {"id": 99, "type": chat_type},
                 **message,
@@ -291,13 +325,63 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.get_thread(99), "thread-a")
         self.assertEqual(self.telegram.messages[-1], (99, "answer"))
 
+    async def test_message_gets_visible_acknowledgement(self):
+        self.runner.results.append(CodexResult(True, "answer", thread_id="thread-a"))
+        message = self.update({"text": "question", "date": int(time.time())})
+        with self.assertLogs(level="INFO") as captured:
+            await self.bridge.handle_update(message)
+        self.assertEqual(self.telegram.messages[0], (99, "👍 Received — working."))
+        logs = "\n".join(captured.output)
+        self.assertIn("telegram message received update_id=1 message_id=55", logs)
+        self.assertIn("telegram_sent_at=", logs)
+        self.assertIn("received_at=", logs)
+        self.assertIn("inbound_lag=", logs)
+        self.assertIn("telegram acknowledgement sent message_id=55", logs)
+        self.assertIn("request_duration=", logs)
+        self.assertIn("since_receive=", logs)
+        self.assertIn("telegram_to_ack=", logs)
+        await self.bridge.active_task
+        self.assertEqual(self.telegram.messages[-1], (99, "answer"))
+
+    async def test_peek_reports_active_and_latest_turn(self):
+        self.bridge._start_turn(99, {"message_id": 55, "text": "question"})
+        await self.bridge.handle_command(99, "/peek")
+        self.assertIn("Turn: working", self.telegram.messages[-1][1])
+        self.bridge.active_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.bridge.active_task
+        self.bridge._finish_turn("delivered")
+        await self.bridge.handle_command(99, "/peek")
+        self.assertIn("Last turn: completed", self.telegram.messages[-1][1])
+        self.assertIn("Result: delivered", self.telegram.messages[-1][1])
+
+    async def test_completed_turn_requests_recycle_above_file_cache_threshold(self):
+        self.bridge.cache_recycle_bytes = 100
+        self.bridge.cache_recycle_min_uptime_seconds = 0
+        self.bridge.memory_reader = lambda: CgroupMemory(150, 10, 120)
+        self.runner.results.append(CodexResult(True, "answer", thread_id="thread-a"))
+        await self.bridge.handle_update(self.update({"text": "question"}))
+        await self.bridge.active_task
+        await asyncio.sleep(0)
+        self.assertTrue(self.bridge.recycle_event.is_set())
+        self.assertEqual(self.telegram.messages[-1], (99, "answer"))
+
+    async def test_status_reports_cgroup_memory_breakdown(self):
+        self.bridge.memory_reader = lambda: CgroupMemory(
+            3 * 1024**3, 32 * 1024**2, 2 * 1024**3
+        )
+        await self.bridge.handle_update(self.update({"text": "/status"}))
+        status = self.telegram.messages[-1][1]
+        self.assertIn("Bridge memory: 3.0 GiB", status)
+        self.assertIn("file cache 2.0 GiB", status)
+
     async def test_generated_image_is_sent_without_empty_message(self):
         image = Path.home() / ".codex" / "generated_images" / "result.png"
         self.runner.results.append(CodexResult(True, "", thread_id="thread-a", generated_images=(image,)))
         await self.bridge.handle_update(self.update({"text": "make an image"}))
         await self.bridge.active_task
         self.assertEqual(self.telegram.photos, [(99, image)])
-        self.assertEqual(self.telegram.messages, [])
+        self.assertEqual(self.telegram.messages, [(99, "👍 Received — working.")])
 
     async def test_confirmation_then_confirm(self):
         self.runner.results.extend(

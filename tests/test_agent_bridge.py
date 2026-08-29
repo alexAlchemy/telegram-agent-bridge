@@ -16,6 +16,7 @@ from agent_bridge import (  # noqa: E402
     GrokRunner,
     extract_grok_image_paths,
     load_instance_config,
+    register_commands,
     send_startup_notification,
 )
 from bridge import CodexResult, MAX_OUTBOUND_IMAGE_BYTES, StateDB  # noqa: E402
@@ -28,11 +29,17 @@ class FakeTelegram:
     async def send_message(self, chat_id, text):
         self.messages.append((chat_id, text))
 
+    async def request(self, method, payload=None):
+        self.last_request = (method, payload)
+        return True
+
     async def send_typing(self, chat_id):
         return None
 
 
 class FakeRunner:
+    workspace = Path("/home/alex/code/telegram-narrator")
+
     async def cancel(self):
         return False
 
@@ -41,6 +48,13 @@ class FakeRunner:
 
 
 class StartupNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_registration_includes_peek(self):
+        telegram = FakeTelegram()
+        await register_commands(telegram, "codex")
+        method, payload = telegram.last_request
+        self.assertEqual(method, "setMyCommands")
+        self.assertIn("peek", {item["command"] for item in payload["commands"]})
+
     async def test_backend_online_message(self):
         telegram = FakeTelegram()
         await send_startup_notification(telegram, 99, "codex")
@@ -156,9 +170,8 @@ class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).encode()
         )
         reader.feed_eof()
-        with mock.patch("agent_bridge.GROK_SESSION_ROOT", session_root), mock.patch(
-            "agent_bridge.GROK_WORKSPACE_KEY", "workspace"
-        ):
+        self.runner.workspace_key = "workspace"
+        with mock.patch("agent_bridge.GROK_SESSION_ROOT", session_root):
             result = await self.runner._read_stdout(reader)
         self.assertEqual(result.generated_images, (image.resolve(),))
 
@@ -247,7 +260,27 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             config["state_path"], Path("/var/lib/telegram-agent/grok/state.sqlite3")
         )
-        self.assertEqual(config["workspace"], Path("/home/alex"))
+        self.assertEqual(
+            config["workspace"], Path("/home/alex/code/telegram-narrator")
+        )
+
+    def test_backend_workspaces_are_fixed(self):
+        base = {
+            "TELEGRAM_BOT_TOKEN": "not-logged",
+            "TELEGRAM_ALLOWED_USER_ID": "123456789",
+        }
+        with mock.patch.dict(
+            os.environ, {**base, "AGENT_WORKSPACE": "/home/alex"}, clear=True
+        ):
+            with self.assertRaisesRegex(SystemExit, "for grok"):
+                load_instance_config("grok")
+        with mock.patch.dict(
+            os.environ,
+            {**base, "AGENT_WORKSPACE": "/home/alex/code/telegram-narrator"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(SystemExit, "for codex"):
+                load_instance_config("codex")
 
 
 if __name__ == "__main__":

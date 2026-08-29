@@ -94,6 +94,7 @@ Legacy single-instance scripts remain for migration compatibility. See `INSTANCE
 
 - `/new` clears the current bridge session mapping.
 - `/status` shows backend, activity, session, and confirmation state.
+- `/peek` shows current progress or the latest turn result.
 - `/cancel` terminates the active backend process group.
 - `/confirm` performs exactly the pending external action.
 - `/deny` discards the pending external action.

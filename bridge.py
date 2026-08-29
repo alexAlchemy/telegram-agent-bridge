@@ -19,8 +19,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -31,6 +32,9 @@ GENERATED_IMAGE_PATTERN = re.compile(
     r"(?P<path>/home/alex/\.codex/generated_images/[A-Za-z0-9._/-]+\.(?:png|jpe?g|webp))"
 )
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
+SUBPROCESS_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
+DEFAULT_CACHE_RECYCLE_BYTES = 2560 * 1024 * 1024
+DEFAULT_CACHE_RECYCLE_MIN_UPTIME_SECONDS = 30 * 60
 SAFE_ENV_KEYS = {
     "HOME",
     "USER",
@@ -97,6 +101,90 @@ class CodexResult:
     usage: dict[str, Any] | None = None
     generated_images: tuple[Path, ...] = ()
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CgroupMemory:
+    current: int
+    anonymous: int
+    file_cache: int
+
+
+@dataclass(slots=True)
+class TurnSnapshot:
+    state: str
+    stage: str
+    started_at: float
+    started_wall: float
+    message_id: int | None = None
+    duration: float | None = None
+    finished_wall: float | None = None
+    result: str | None = None
+
+
+def read_cgroup_memory(
+    proc_cgroup: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> CgroupMemory | None:
+    """Read this process's cgroup-v2 memory counters when available."""
+    try:
+        relative = next(
+            line.partition("::")[2]
+            for line in proc_cgroup.read_text().splitlines()
+            if line.startswith("0::")
+        )
+        root = cgroup_root.resolve()
+        group = (root / relative.lstrip("/")).resolve()
+        group.relative_to(root)
+        current = int((group / "memory.current").read_text().strip())
+        stats = {}
+        for line in (group / "memory.stat").read_text().splitlines():
+            key, value = line.split(maxsplit=1)
+            stats[key] = int(value)
+        return CgroupMemory(
+            current=current,
+            anonymous=stats.get("anon", 0),
+            file_cache=stats.get("file", 0),
+        )
+    except (FileNotFoundError, OSError, StopIteration, ValueError):
+        return None
+
+
+def format_bytes(value: int) -> str:
+    return f"{value / (1024 ** 3):.1f} GiB"
+
+
+def format_utc_timestamp(value: float) -> str:
+    return (
+        datetime.fromtimestamp(value, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+async def iter_subprocess_lines(
+    stream: asyncio.StreamReader,
+) -> AsyncIterator[bytes]:
+    """Yield bounded lines while draining and skipping oversized JSONL events."""
+    discarding = False
+    while True:
+        try:
+            line = await stream.readuntil(b"\n")
+        except asyncio.LimitOverrunError as exc:
+            discarding = True
+            await stream.read(min(max(exc.consumed, 1), 64 * 1024))
+            continue
+        except asyncio.IncompleteReadError as exc:
+            if exc.partial and not discarding:
+                yield exc.partial
+            elif discarding:
+                logging.warning("discarded oversized subprocess event at EOF")
+            return
+        if discarding:
+            logging.warning("discarded oversized subprocess event")
+            discarding = False
+            continue
+        yield line
 
 
 class StateDB:
@@ -352,6 +440,7 @@ class CodexRunner:
             argv[1:1] = [
                 "-c", 'mcp_servers.telegram_bridge.command="/usr/bin/python3"',
                 "-c", f"mcp_servers.telegram_bridge.args={json.dumps([str(self.mcp_server_path)])}",
+                "-c", 'mcp_servers.telegram_bridge.env_vars=["TELEGRAM_BRIDGE_TURN_ID","TELEGRAM_BRIDGE_PAYLOAD_FILE"]',
             ]
         if image_path:
             argv.extend(["-i", str(image_path)])
@@ -392,6 +481,7 @@ class CodexRunner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=SUBPROCESS_STREAM_LIMIT_BYTES,
                 start_new_session=True,
             )
             assert self.process.stdin is not None
@@ -445,7 +535,7 @@ class CodexRunner:
         final_text: str | None = None
         usage: dict[str, Any] | None = None
         failed = False
-        async for raw_line in stream:
+        async for raw_line in iter_subprocess_lines(stream):
             try:
                 event = json.loads(raw_line)
             except json.JSONDecodeError:
@@ -475,7 +565,7 @@ class CodexRunner:
         if stream is None:
             return
         total = 0
-        async for chunk in stream:
+        while chunk := await stream.read(64 * 1024):
             total += len(chunk)
         if total:
             logging.debug("codex stderr bytes=%d", total)
@@ -489,6 +579,9 @@ class Bridge:
         runner: CodexRunner,
         allowed_user_id: int,
         upload_root: Path,
+        cache_recycle_bytes: int = 0,
+        cache_recycle_min_uptime_seconds: int = DEFAULT_CACHE_RECYCLE_MIN_UPTIME_SECONDS,
+        memory_reader: Any = read_cgroup_memory,
     ) -> None:
         self.telegram = telegram
         self.state = state
@@ -498,6 +591,12 @@ class Bridge:
         self.active_task: asyncio.Task[None] | None = None
         self.active_chat_id: int | None = None
         self.stopping = False
+        self.cache_recycle_bytes = cache_recycle_bytes
+        self.cache_recycle_min_uptime_seconds = cache_recycle_min_uptime_seconds
+        self.memory_reader = memory_reader
+        self.started_at = time.monotonic()
+        self.recycle_event = asyncio.Event()
+        self.last_turn: TurnSnapshot | None = None
 
     async def run_forever(self) -> None:
         cleanup_upload_root(self.upload_root)
@@ -527,6 +626,8 @@ class Bridge:
                 await asyncio.wait_for(self.active_task, timeout=10)
 
     async def handle_update(self, update: dict[str, Any]) -> None:
+        received_wall = time.time()
+        received_monotonic = time.monotonic()
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -537,6 +638,27 @@ class Bridge:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
+        update_id = update.get("update_id")
+        message_id = message.get("message_id")
+        telegram_date = message.get("date")
+        if isinstance(telegram_date, int) and not isinstance(telegram_date, bool):
+            logging.info(
+                "telegram message received update_id=%s message_id=%s "
+                "telegram_sent_at=%s received_at=%s inbound_lag=%.3fs",
+                update_id,
+                message_id,
+                format_utc_timestamp(telegram_date),
+                format_utc_timestamp(received_wall),
+                received_wall - telegram_date,
+            )
+        else:
+            logging.info(
+                "telegram message received update_id=%s message_id=%s "
+                "telegram_sent_at=unknown received_at=%s inbound_lag=unknown",
+                update_id,
+                message_id,
+                format_utc_timestamp(received_wall),
+            )
         text = message.get("text")
         command = parse_command(text) if isinstance(text, str) else None
         if command:
@@ -551,6 +673,33 @@ class Bridge:
             )
             return
         self.state.set_pending_confirmation(chat_id, None)
+        acknowledgement_started = time.monotonic()
+        try:
+            await self.telegram.send_message(chat_id, "👍 Received — working.")
+        except TelegramError:
+            acknowledgement_finished = time.monotonic()
+            logging.warning(
+                "telegram acknowledgement failed message_id=%s "
+                "request_duration=%.3fs since_receive=%.3fs",
+                message_id,
+                acknowledgement_finished - acknowledgement_started,
+                acknowledgement_finished - received_monotonic,
+            )
+        else:
+            acknowledgement_finished = time.monotonic()
+            logging.info(
+                "telegram acknowledgement sent message_id=%s "
+                "request_duration=%.3fs since_receive=%.3fs telegram_to_ack=%s",
+                message_id,
+                acknowledgement_finished - acknowledgement_started,
+                acknowledgement_finished - received_monotonic,
+                (
+                    f"{time.time() - telegram_date:.3f}s"
+                    if isinstance(telegram_date, int)
+                    and not isinstance(telegram_date, bool)
+                    else "unknown"
+                ),
+            )
         self._start_turn(chat_id, message)
 
     async def handle_command(self, chat_id: int, command: str) -> None:
@@ -564,7 +713,13 @@ class Bridge:
             status = [f"Status: {'working' if active else 'idle'}", "Workspace: /home/alex"]
             status.append(f"Session: {thread_id[:12] + '…' if thread_id else 'new'}")
             status.append(f"Pending confirmation: {'yes' if pending else 'no'}")
+            memory_status = self.memory_status()
+            if memory_status:
+                status.append(memory_status)
             await self.telegram.send_message(chat_id, "\n".join(status))
+            return
+        if command == "/peek":
+            await self.telegram.send_message(chat_id, self.peek_status())
             return
         if command == "/new":
             if self.active_task and not self.active_task.done():
@@ -604,16 +759,93 @@ class Bridge:
     def _start_turn(
         self, chat_id: int, message: dict[str, Any], confirmation_turn: bool = False
     ) -> None:
+        message_id = message.get("message_id")
+        self.last_turn = TurnSnapshot(
+            state="working",
+            stage="received",
+            started_at=time.monotonic(),
+            started_wall=time.time(),
+            message_id=message_id if isinstance(message_id, int) else None,
+        )
         self.active_chat_id = chat_id
         self.active_task = asyncio.create_task(
             self.process_turn(chat_id, message, confirmation_turn), name="codex-turn"
         )
         self.active_task.add_done_callback(self._turn_done)
 
+    def _set_turn_stage(self, stage: str) -> None:
+        if self.last_turn and self.last_turn.state == "working":
+            self.last_turn.stage = stage
+
+    def _finish_turn(self, result: str) -> None:
+        if not self.last_turn or self.last_turn.state != "working":
+            return
+        finished = time.time()
+        self.last_turn.state = "completed" if result == "delivered" else "failed"
+        self.last_turn.stage = "completed" if result == "delivered" else "failed"
+        self.last_turn.duration = time.monotonic() - self.last_turn.started_at
+        self.last_turn.finished_wall = finished
+        self.last_turn.result = result
+
+    def peek_status(self) -> str:
+        turn = self.last_turn
+        if turn is None:
+            return "No turn has been recorded since the bridge started."
+        if turn.state == "working":
+            elapsed = time.monotonic() - turn.started_at
+            lines = [
+                "Turn: working",
+                f"Elapsed: {elapsed:.1f} seconds",
+                f"Stage: {turn.stage}",
+                f"Started: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(turn.started_wall))}",
+            ]
+        else:
+            lines = [
+                f"Last turn: {turn.state}",
+                f"Duration: {(turn.duration or 0):.1f} seconds",
+                f"Finished: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(turn.finished_wall or turn.started_wall))}",
+                f"Result: {turn.result or 'unknown'}",
+            ]
+        memory = self.memory_status()
+        if memory:
+            lines.append(memory)
+        return "\n".join(lines)
+
     def _turn_done(self, task: asyncio.Task[None]) -> None:
         self.active_chat_id = None
         if not task.cancelled() and task.exception():
             logging.error("turn task failed: %s", type(task.exception()).__name__)
+        self._request_recycle_if_needed()
+
+    def _request_recycle_if_needed(self) -> None:
+        if not self.cache_recycle_bytes or self.recycle_event.is_set():
+            return
+        memory = self.memory_reader()
+        if memory is None or memory.file_cache < self.cache_recycle_bytes:
+            return
+        uptime = time.monotonic() - self.started_at
+        if uptime < self.cache_recycle_min_uptime_seconds:
+            logging.info(
+                "cache recycle deferred uptime=%.0fs file_cache=%d threshold=%d",
+                uptime, memory.file_cache, self.cache_recycle_bytes,
+            )
+            return
+        logging.warning(
+            "requesting idle bridge recycle current=%d file_cache=%d anonymous=%d threshold=%d",
+            memory.current, memory.file_cache, memory.anonymous, self.cache_recycle_bytes,
+        )
+        self.recycle_event.set()
+
+    def memory_status(self) -> str | None:
+        memory = self.memory_reader()
+        if memory is None:
+            return None
+        return (
+            "Bridge memory: "
+            f"{format_bytes(memory.current)} "
+            f"(file cache {format_bytes(memory.file_cache)}, "
+            f"anonymous {format_bytes(memory.anonymous)})"
+        )
 
     async def process_turn(
         self, chat_id: int, message: dict[str, Any], confirmation_turn: bool
@@ -622,6 +854,7 @@ class Bridge:
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
         started = time.monotonic()
         try:
+            self._set_turn_stage("processing")
             prompt = message.get("text") or message.get("caption") or "Analyze the attached file."
             image_path: Path | None = None
             attachment = get_attachment(message)
@@ -645,6 +878,7 @@ class Bridge:
             if not result.success:
                 logging.warning("codex turn failed duration=%.1fs error=%s", duration, result.error)
                 await self.telegram.send_message(chat_id, f"Codex could not complete that turn: {result.error}")
+                self._finish_turn("backend failed")
                 return
             if result.thread_id:
                 self.state.set_thread(chat_id, result.thread_id)
@@ -665,18 +899,22 @@ class Bridge:
                 usage.get("input_tokens", "unknown"),
                 usage.get("output_tokens", "unknown"),
             )
+            self._set_turn_stage("sending")
             for image_path in result.generated_images:
                 await self.telegram.send_photo(chat_id, image_path)
             if reply:
                 await self.telegram.send_message(chat_id, reply)
             elif not result.generated_images:
                 await self.telegram.send_message(chat_id, "Codex completed without a response.")
+            self._finish_turn("delivered")
         except BridgeError as exc:
             await self.telegram.send_message(chat_id, str(exc))
+            self._finish_turn("rejected")
         except Exception as exc:  # Last-resort containment; do not expose internals to Telegram.
             logging.exception("unexpected turn failure: %s", type(exc).__name__)
             with contextlib.suppress(TelegramError):
                 await self.telegram.send_message(chat_id, "The bridge encountered an internal error.")
+            self._finish_turn("internal error")
         finally:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -862,6 +1100,7 @@ def help_text() -> str:
         "inspect files, and work inside /home/alex.\n\n"
         "/new — start a fresh Codex session\n"
         "/status — show bridge and session status\n"
+        "/peek — show progress or the latest turn result\n"
         "/cancel — stop the active Codex turn\n"
         "/confirm — approve the exact pending external action\n"
         "/deny — discard the pending external action\n"

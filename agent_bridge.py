@@ -16,28 +16,32 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from bridge import (
     CodexResult as BackendResult,
     Bridge,
     BridgeError,
     CodexRunner,
+    DEFAULT_CACHE_RECYCLE_BYTES,
+    DEFAULT_CACHE_RECYCLE_MIN_UPTIME_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     DEVELOPER_INSTRUCTIONS,
     MAX_FILE_BYTES,
     MAX_OUTBOUND_IMAGE_BYTES,
+    SUBPROCESS_STREAM_LIMIT_BYTES,
     SAFE_ENV_KEYS,
     StateDB,
     TelegramClient,
     TelegramError,
     cleanup_upload_root,
+    iter_subprocess_lines,
     configure_logging,
     get_attachment,
 )
 
 
 GROK_SESSION_ROOT = Path.home() / ".grok" / "sessions"
-GROK_WORKSPACE_KEY = "%2Fhome%2Falex"
 GROK_ABSOLUTE_IMAGE_PATTERN = re.compile(
     r"(?P<path>/home/alex/\.grok/sessions/[^\s\]\[()<>]+/"
     r"[^\s\]\[()<>]+/images/[^\s\]\[()<>]+\.(?:png|jpe?g|webp))",
@@ -69,7 +73,7 @@ def extract_grok_image_paths(
                 collect(nested)
 
     session_root = session_root or GROK_SESSION_ROOT
-    workspace_key = workspace_key or GROK_WORKSPACE_KEY
+    workspace_key = workspace_key or quote("/home/alex/code/telegram-narrator", safe="")
     collect(value)
     candidates: list[Path] = []
     for string in strings:
@@ -122,6 +126,7 @@ class GrokRunner:
         self.prompt_root = prompt_root
         self.timeout_seconds = timeout_seconds
         self.max_turns = max_turns
+        self.workspace_key = quote(str(workspace), safe="")
         self.process: asyncio.subprocess.Process | None = None
         self.schema_json = json.dumps(
             json.loads(schema_path.read_text()), separators=(",", ":")
@@ -196,6 +201,7 @@ class GrokRunner:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=SUBPROCESS_STREAM_LIMIT_BYTES,
                 start_new_session=True,
             )
             stdout_task = asyncio.create_task(self._read_stdout(self.process.stdout))
@@ -236,18 +242,22 @@ class GrokRunner:
         usage: dict[str, Any] | None = None
         generated_images: list[Path] = []
         failed = False
-        async for raw_line in stream:
+        async for raw_line in iter_subprocess_lines(stream):
             try:
                 event = json.loads(raw_line)
             except json.JSONDecodeError:
                 continue
-            for image_path in extract_grok_image_paths(event):
+            for image_path in extract_grok_image_paths(
+                event, workspace_key=self.workspace_key
+            ):
                 if image_path not in generated_images:
                     generated_images.append(image_path)
             if event.get("type") == "end":
                 if isinstance(event.get("sessionId"), str):
                     session_id = event["sessionId"]
-                for image_path in extract_grok_image_paths(event, session_id):
+                for image_path in extract_grok_image_paths(
+                    event, session_id, workspace_key=self.workspace_key
+                ):
                     if image_path not in generated_images:
                         generated_images.append(image_path)
                 if isinstance(event.get("structuredOutput"), dict):
@@ -297,7 +307,7 @@ class GrokRunner:
         if stream is None:
             return
         total = 0
-        async for chunk in stream:
+        while chunk := await stream.read(64 * 1024):
             total += len(chunk)
         if total:
             logging.debug("grok stderr bytes=%d", total)
@@ -320,10 +330,13 @@ class AgentBridge(Bridge):
             status = [
                 f"Status: {'working' if active else 'idle'}",
                 f"Backend: {self.backend_name}",
-                "Workspace: /home/alex",
+                f"Workspace: {self.runner.workspace}",
                 f"Session: {thread_id[:12] + '…' if thread_id else 'new'}",
                 f"Pending confirmation: {'yes' if pending else 'no'}",
             ]
+            memory_status = self.memory_status()
+            if memory_status:
+                status.append(memory_status)
             await self.telegram.send_message(chat_id, "\n".join(status))
             return
         if command == "/new":
@@ -346,6 +359,7 @@ class AgentBridge(Bridge):
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
         started = time.monotonic()
         try:
+            self._set_turn_stage("processing")
             prompt = message.get("text") or message.get("caption") or "Analyze the attached file."
             image_path: Path | None = None
             attachment = get_attachment(message)
@@ -381,6 +395,7 @@ class AgentBridge(Bridge):
                     chat_id,
                     f"{self.backend_title} could not complete that turn: {result.error}",
                 )
+                self._finish_turn("backend failed")
                 return
             if result.thread_id:
                 self.state.set_thread(chat_id, result.thread_id)
@@ -403,6 +418,7 @@ class AgentBridge(Bridge):
                 usage.get("input_tokens", "unknown"),
                 usage.get("output_tokens", "unknown"),
             )
+            self._set_turn_stage("sending")
             for generated_image in result.generated_images:
                 await self.telegram.send_photo(chat_id, generated_image)
             if reply:
@@ -411,14 +427,17 @@ class AgentBridge(Bridge):
                 await self.telegram.send_message(
                     chat_id, f"{self.backend_title} completed without a response."
                 )
+            self._finish_turn("delivered")
         except BridgeError as exc:
             await self.telegram.send_message(chat_id, str(exc))
+            self._finish_turn("rejected")
         except Exception as exc:
             logging.exception("unexpected turn failure: %s", type(exc).__name__)
             with contextlib.suppress(TelegramError):
                 await self.telegram.send_message(
                     chat_id, "The bridge encountered an internal error."
                 )
+            self._finish_turn("internal error")
         finally:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -433,6 +452,7 @@ class AgentBridge(Bridge):
             "inside /home/alex.\n\n"
             f"/new — start a fresh {self.backend_title} session\n"
             "/status — show backend and session status\n"
+            "/peek — show progress or the latest turn result\n"
             "/cancel — stop the active turn\n"
             "/confirm — approve the exact pending external action\n"
             "/deny — discard the pending external action\n"
@@ -459,12 +479,30 @@ def load_instance_config(backend: str) -> dict[str, Any]:
             os.environ.get("AGENT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))
         )
         grok_max_turns = int(os.environ.get("GROK_MAX_TURNS", "100"))
+        cache_recycle_bytes = int(
+            os.environ.get("CODEX_CACHE_RECYCLE_BYTES", str(DEFAULT_CACHE_RECYCLE_BYTES))
+        )
+        cache_recycle_min_uptime_seconds = int(
+            os.environ.get(
+                "CODEX_CACHE_RECYCLE_MIN_UPTIME_SECONDS",
+                str(DEFAULT_CACHE_RECYCLE_MIN_UPTIME_SECONDS),
+            )
+        )
     except ValueError as exc:
         raise SystemExit("Numeric bridge configuration is invalid") from exc
     base_dir = Path(__file__).resolve().parent
-    workspace = Path(os.environ.get("AGENT_WORKSPACE", "/home/alex")).resolve()
-    if workspace != Path("/home/alex"):
-        raise SystemExit("AGENT_WORKSPACE must be exactly /home/alex")
+    expected_workspace = (
+        Path("/home/alex")
+        if backend == "codex"
+        else Path("/home/alex/code/telegram-narrator")
+    )
+    workspace = Path(
+        os.environ.get("AGENT_WORKSPACE", str(expected_workspace))
+    ).resolve()
+    if workspace != expected_workspace:
+        raise SystemExit(
+            f"AGENT_WORKSPACE for {backend} must be exactly {expected_workspace}"
+        )
     return {
         "backend": backend,
         "token": token,
@@ -489,7 +527,27 @@ def load_instance_config(backend: str) -> dict[str, Any]:
         "codex_binary": os.environ.get("CODEX_BINARY", "/usr/local/bin/codex"),
         "grok_binary": os.environ.get("GROK_BINARY", "/home/alex/.local/bin/grok"),
         "grok_max_turns": grok_max_turns,
+        "cache_recycle_bytes": cache_recycle_bytes if backend == "codex" else 0,
+        "cache_recycle_min_uptime_seconds": cache_recycle_min_uptime_seconds,
     }
+
+
+BOT_COMMANDS = [
+    {"command": "new", "description": "Start a fresh agent session"},
+    {"command": "status", "description": "Show bridge and session status"},
+    {"command": "peek", "description": "Show current or latest turn progress"},
+    {"command": "cancel", "description": "Stop the active agent turn"},
+    {"command": "confirm", "description": "Approve the exact pending external action"},
+    {"command": "deny", "description": "Discard the pending external action"},
+    {"command": "help", "description": "Show usage help"},
+]
+
+
+async def register_commands(telegram: TelegramClient, backend: str) -> None:
+    try:
+        await telegram.request("setMyCommands", {"commands": BOT_COMMANDS})
+    except TelegramError:
+        logging.warning("%s command registration failed", backend)
 
 
 async def send_startup_notification(telegram: TelegramClient, chat_id: int, backend: str) -> None:
@@ -531,20 +589,29 @@ async def async_main() -> None:
         config["allowed_user_id"],
         config["upload_root"],
         backend_name=backend,
+        cache_recycle_bytes=config["cache_recycle_bytes"],
+        cache_recycle_min_uptime_seconds=config["cache_recycle_min_uptime_seconds"],
     )
     cleanup_upload_root(config["upload_root"])
+    await register_commands(telegram, backend)
     await send_startup_notification(telegram, config["allowed_user_id"], backend)
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
     task = asyncio.create_task(bridge.run_forever())
-    await stop_event.wait()
+    stop_task = asyncio.create_task(stop_event.wait())
+    recycle_task = asyncio.create_task(bridge.recycle_event.wait())
+    await asyncio.wait((stop_task, recycle_task), return_when=asyncio.FIRST_COMPLETED)
     await bridge.stop()
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+    stop_task.cancel()
+    recycle_task.cancel()
     state.close()
+    if bridge.recycle_event.is_set():
+        raise SystemExit(75)
 
 
 def main() -> None:
