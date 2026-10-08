@@ -345,6 +345,34 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.reply, "got: secret prompt text")
         self.assertEqual(list((self.root / "prompts").iterdir()), [])
 
+    async def test_timing_reports_cli_metrics_and_startup(self):
+        executable = self.root / "fake-claude-timed"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "sys.stdin.read()\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 's-2'}))\n"
+            "payload = {'reply': 'ok', 'confirmation_required': False, 'confirmation_summary': None}\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,"
+            " 'session_id': 's-2', 'structured_output': payload, 'duration_ms': 123,"
+            " 'duration_api_ms': 99, 'ttft_ms': 40, 'first_content_frame_ms': 30,"
+            " 'num_turns': 1}))\n"
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        runner = ClaudeRunner(
+            str(executable), Path("/home/alex"), self.schema, self.root / "prompts", 10
+        )
+        result = await runner.run("hi", None)
+        self.assertTrue(result.success)
+        timing = result.timing
+        self.assertEqual(timing["cli_ms"], 123)
+        self.assertEqual(timing["api_ms"], 99)
+        self.assertEqual(timing["ttft_ms"], 40)
+        self.assertEqual(timing["num_turns"], 1)
+        self.assertIsNotNone(timing["init_ms"])
+        self.assertGreaterEqual(timing["spawn_ms"], 0)
+        self.assertIsInstance(timing["cli_overhead_ms"], int)
+
 
 class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -370,6 +398,25 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Backend: grok", self.telegram.messages[-1][1])
         await self.bridge.handle_command(99, "/new")
         self.assertIn("Grok", self.telegram.messages[-1][1])
+
+    async def test_turn_timing_is_one_json_line_without_content(self):
+        class TimedRunner(FakeRunner):
+            async def run(self, prompt, thread_id, image_path=None):
+                return CodexResult(
+                    True, "secret reply", thread_id="s-3", timing={"cli_ms": 5}
+                )
+
+        self.bridge.runner = TimedRunner()
+        with self.assertLogs(level="INFO") as logs:
+            await self.bridge.process_turn(99, {"text": "private question"}, False)
+        line = next(entry for entry in logs.output if "turn_timing" in entry)
+        payload = json.loads(line.split("turn_timing ", 1)[1])
+        self.assertEqual(payload["outcome"], "delivered")
+        self.assertEqual(payload["cli_ms"], 5)
+        self.assertEqual(payload["backend"], "grok")
+        self.assertIn("total_ms", payload)
+        self.assertNotIn("private question", line)
+        self.assertNotIn("secret reply", line)
 
 
 class ConfigTests(unittest.TestCase):

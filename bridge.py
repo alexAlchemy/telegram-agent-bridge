@@ -101,6 +101,7 @@ class CodexResult:
     usage: dict[str, Any] | None = None
     generated_images: tuple[Path, ...] = ()
     error: str | None = None
+    timing: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,7 @@ import shutil
 import signal
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -407,11 +408,13 @@ class ClaudeRunner:
             prefix="prompt-", suffix=".txt", dir=self.prompt_root
         )
         prompt_file = Path(prompt_name)
+        marks: dict[str, Any] = {}
         try:
             if image_path:
                 prompt = f"{prompt}\n\nUse this referenced image as input: {image_path}"
             with os.fdopen(fd, "w", encoding="utf-8") as output:
                 output.write(prompt)
+            run_started = time.monotonic()
             with prompt_file.open("rb") as stdin_stream:
                 self.process = await asyncio.create_subprocess_exec(
                     *self.build_argv(thread_id),
@@ -423,7 +426,10 @@ class ClaudeRunner:
                     limit=SUBPROCESS_STREAM_LIMIT_BYTES,
                     start_new_session=True,
                 )
-            stdout_task = asyncio.create_task(self._read_stdout(self.process.stdout))
+            spawned = time.monotonic()
+            stdout_task = asyncio.create_task(
+                self._read_stdout(self.process.stdout, marks)
+            )
             stderr_task = asyncio.create_task(self._drain_stderr(self.process.stderr))
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=self.timeout_seconds)
@@ -433,6 +439,7 @@ class ClaudeRunner:
                 return BackendResult(False, "", error="Claude turn timed out")
             parsed = await stdout_task
             await stderr_task
+            parsed.timing = self._timing(run_started, spawned, marks)
             if self.process.returncode != 0:
                 return BackendResult(
                     False,
@@ -451,11 +458,36 @@ class ClaudeRunner:
             with contextlib.suppress(OSError):
                 prompt_file.unlink()
 
+    @staticmethod
+    def _timing(run_started: float, spawned: float, marks: dict[str, Any]) -> dict[str, Any]:
+        """Split one turn's wall time into bridge, CLI-startup, and CLI-reported parts."""
+        now = time.monotonic()
+        cli = marks.get("cli", {})
+        cli_ms = cli.get("duration_ms")
+        init_at = marks.get("init")
+        wall_ms = (now - run_started) * 1000
+        return {
+            "spawn_ms": round((spawned - run_started) * 1000),
+            # Time from spawn to the CLI's init event: process boot before any model work.
+            "init_ms": round((init_at - spawned) * 1000) if init_at else None,
+            "cli_ms": cli_ms,
+            "api_ms": cli.get("duration_api_ms"),
+            "ttft_ms": cli.get("ttft_ms"),
+            "first_content_ms": cli.get("first_content_frame_ms"),
+            "num_turns": cli.get("num_turns"),
+            # Wall time not reported by the CLI: boot before its clock starts, and teardown.
+            "cli_overhead_ms": (
+                round(wall_ms - cli_ms) if isinstance(cli_ms, (int, float)) else None
+            ),
+            "wall_ms": round(wall_ms),
+        }
+
     async def _read_stdout(
-        self, stream: asyncio.StreamReader | None
+        self, stream: asyncio.StreamReader | None, marks: dict[str, Any] | None = None
     ) -> BackendResult:
         if stream is None:
             return BackendResult(False, "", error="Claude stdout was unavailable")
+        marks = marks if marks is not None else {}
         session_id: str | None = None
         final: dict[str, Any] | None = None
         async for raw_line in iter_subprocess_lines(stream):
@@ -467,8 +499,20 @@ class ClaudeRunner:
                 continue
             if isinstance(event.get("session_id"), str):
                 session_id = event["session_id"]
+            if event.get("type") == "system" and event.get("subtype") == "init":
+                marks.setdefault("init", time.monotonic())
             if event.get("type") == "result":
                 final = event
+                marks["cli"] = {
+                    key: final.get(key)
+                    for key in (
+                        "duration_ms",
+                        "duration_api_ms",
+                        "ttft_ms",
+                        "first_content_frame_ms",
+                        "num_turns",
+                    )
+                }
         if final is None:
             return BackendResult(False, "", thread_id=session_id, error="Claude returned no result")
         if isinstance(final.get("session_id"), str):
@@ -551,6 +595,11 @@ class AgentBridge(Bridge):
         turn_dir: Path | None = None
         typing_task = asyncio.create_task(self._typing_loop(chat_id))
         started = time.monotonic()
+        timing: dict[str, Any] = {
+            "turn_id": uuid.uuid4().hex[:8],
+            "backend": self.backend_name,
+            "outcome": "internal error",
+        }
         try:
             self._set_turn_stage("processing")
             prompt = message.get("text") or message.get("caption") or "Analyze the attached file."
@@ -573,9 +622,14 @@ class AgentBridge(Bridge):
                     image_path = destination
                 else:
                     prompt = f"{prompt}\n\nThe uploaded document is available at: {destination}"
+            timing["attachment"] = attachment is not None
+            timing["prep_ms"] = round((time.monotonic() - started) * 1000)
+            runner_started = time.monotonic()
             result = await self.runner.run(
                 prompt, self.state.get_thread(chat_id), image_path
             )
+            timing["runner_ms"] = round((time.monotonic() - runner_started) * 1000)
+            timing.update(result.timing or {})
             duration = time.monotonic() - started
             if not result.success:
                 logging.warning(
@@ -588,6 +642,7 @@ class AgentBridge(Bridge):
                     chat_id,
                     f"{self.backend_title} could not complete that turn: {result.error}",
                 )
+                timing["outcome"] = "backend failed"
                 self._finish_turn("backend failed")
                 return
             if result.thread_id:
@@ -612,6 +667,7 @@ class AgentBridge(Bridge):
                 usage.get("output_tokens", "unknown"),
             )
             self._set_turn_stage("sending")
+            send_started = time.monotonic()
             for generated_image in result.generated_images:
                 await self.telegram.send_photo(chat_id, generated_image)
             if reply:
@@ -620,9 +676,12 @@ class AgentBridge(Bridge):
                 await self.telegram.send_message(
                     chat_id, f"{self.backend_title} completed without a response."
                 )
+            timing["send_ms"] = round((time.monotonic() - send_started) * 1000)
+            timing["outcome"] = "delivered"
             self._finish_turn("delivered")
         except BridgeError as exc:
             await self.telegram.send_message(chat_id, str(exc))
+            timing["outcome"] = "rejected"
             self._finish_turn("rejected")
         except Exception as exc:
             logging.exception("unexpected turn failure: %s", type(exc).__name__)
@@ -630,6 +689,7 @@ class AgentBridge(Bridge):
                 await self.telegram.send_message(
                     chat_id, "The bridge encountered an internal error."
                 )
+            timing["outcome"] = "internal error"
             self._finish_turn("internal error")
         finally:
             typing_task.cancel()
@@ -637,6 +697,9 @@ class AgentBridge(Bridge):
                 await typing_task
             if turn_dir:
                 shutil.rmtree(turn_dir, ignore_errors=True)
+            timing["total_ms"] = round((time.monotonic() - started) * 1000)
+            # One JSON line per turn, so timings can be aggregated with jq. No content.
+            logging.info("turn_timing %s", json.dumps(timing, sort_keys=True))
 
     def help_text(self) -> str:
         return (
