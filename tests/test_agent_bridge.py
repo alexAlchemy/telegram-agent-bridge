@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_bridge import (  # noqa: E402
     AgentBridge,
+    ClaudeRunner,
     GrokRunner,
     extract_grok_image_paths,
     load_instance_config,
@@ -213,6 +214,135 @@ class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):
         result = await runner.run("secret prompt text", None)
         self.assertTrue(result.success)
         self.assertEqual(result.reply, "done")
+        self.assertEqual(list((self.root / "prompts").iterdir()), [])
+
+
+class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.schema = self.root / "schema.json"
+        self.schema.write_text(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "reply": {"type": "string"},
+                        "confirmation_required": {"type": "boolean"},
+                        "confirmation_summary": {"type": ["string", "null"]},
+                    },
+                    "required": [
+                        "reply",
+                        "confirmation_required",
+                        "confirmation_summary",
+                    ],
+                    "additionalProperties": False,
+                }
+            )
+        )
+        self.runner = ClaudeRunner(
+            "/home/alex/.local/bin/claude",
+            Path("/home/alex"),
+            self.schema,
+            self.root / "prompts",
+            timeout_seconds=10,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _result_line(self, **overrides):
+        event = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "session_id": "claude-session",
+            "structured_output": {
+                "reply": "hello",
+                "confirmation_required": False,
+                "confirmation_summary": None,
+            },
+            "usage": {"input_tokens": 3, "output_tokens": 5},
+        }
+        event.update(overrides)
+        return (json.dumps(event) + "\n").encode()
+
+    def test_argv_is_non_interactive_and_resumes_session(self):
+        argv = self.runner.build_argv(None)
+        self.assertIn("-p", argv)
+        self.assertIn("stream-json", argv)
+        self.assertIn("bypassPermissions", argv)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertNotIn("--resume", argv)
+        self.assertNotIn("--max-turns", argv)
+        resumed = self.runner.build_argv("claude-session")
+        self.assertEqual(resumed[resumed.index("--resume") + 1], "claude-session")
+
+    def test_environment_excludes_bot_and_provider_secrets(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-secret",
+                "ANTHROPIC_API_KEY": "provider-secret",
+                "HOME": "/home/alex",
+                "PATH": "/usr/bin",
+            },
+            clear=True,
+        ):
+            environment = self.runner._environment()
+        self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+        self.assertEqual(environment["HOME"], "/home/alex")
+
+    async def test_result_event_is_normalized(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(self._result_line())
+        reader.feed_eof()
+        result = await self.runner._read_stdout(reader)
+        self.assertTrue(result.success)
+        self.assertEqual(result.reply, "hello")
+        self.assertEqual(result.thread_id, "claude-session")
+        self.assertEqual(result.usage, {"input_tokens": 3, "output_tokens": 5})
+
+    async def test_error_result_is_a_failed_turn_and_keeps_session(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(self._result_line(is_error=True, subtype="error_max_turns"))
+        reader.feed_eof()
+        result = await self.runner._read_stdout(reader)
+        self.assertFalse(result.success)
+        self.assertEqual(result.thread_id, "claude-session")
+
+    async def test_missing_result_and_malformed_reply_fail_closed(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"type": "assistant"}\n')
+        reader.feed_eof()
+        self.assertFalse((await self.runner._read_stdout(reader)).success)
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(self._result_line(structured_output={"reply": 7}))
+        reader.feed_eof()
+        result = await self.runner._read_stdout(reader)
+        self.assertFalse(result.success)
+        self.assertIn("invalid structured reply", result.error)
+
+    async def test_fake_claude_receives_prompt_on_stdin_and_cleans_up(self):
+        executable = self.root / "fake-claude"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "prompt = sys.stdin.read()\n"
+            "payload = {'reply': 'got: ' + prompt, 'confirmation_required': False,"
+            " 'confirmation_summary': None}\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,"
+            " 'session_id': 's-1', 'structured_output': payload}))\n"
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        runner = ClaudeRunner(
+            str(executable), Path("/home/alex"), self.schema, self.root / "prompts", 10
+        )
+        result = await runner.run("secret prompt text", None)
+        self.assertTrue(result.success)
+        self.assertEqual(result.reply, "got: secret prompt text")
         self.assertEqual(list((self.root / "prompts").iterdir()), [])
 
 

@@ -34,13 +34,30 @@ sudo systemctl enable --now telegram-agent@grok.service
 
 Never paste a bot token into chat or shell command arguments.
 
+## Configure the Claude Code bot
+
+The `claude` instance drives the local Claude Code CLI
+(`/home/alex/.local/bin/claude`) headlessly with `claude -p`. It uses the
+`alex` user's existing Claude Code login. It needs its own BotFather token:
+
+```bash
+sudo /home/alex/codex-telegram-bridge/configure_instance.sh claude
+sudo systemctl enable --now telegram-agent@claude.service
+```
+
+Claude runs with `--permission-mode bypassPermissions`, so it has unrestricted
+tool use inside the workspace `/home/alex`. The systemd unit's confinement is the
+outer boundary. Only the allowed Telegram user can reach it.
+
 ## Operate instances
 
 ```bash
 systemctl status telegram-agent@codex.service --no-pager -l
 systemctl status telegram-agent@grok.service --no-pager -l
+systemctl status telegram-agent@claude.service --no-pager -l
 journalctl -u telegram-agent@codex.service -n 120 --no-pager
 journalctl -u telegram-agent@grok.service -n 120 --no-pager
+journalctl -u telegram-agent@claude.service -n 120 --no-pager
 ```
 
 Both bots may run simultaneously because they use distinct tokens. Stopping or
