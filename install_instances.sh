@@ -6,7 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-SOURCE_DIR=/home/alex/codex-telegram-bridge
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR=/usr/local/lib/codex-telegram-bridge
 
 /usr/bin/install -d -o root -g root -m 0755 "$INSTALL_DIR"

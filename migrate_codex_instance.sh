@@ -5,6 +5,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
     echo "Run this migration with sudo." >&2
     exit 1
 fi
+agent_home="$(getent passwd "${SUDO_USER:-alex}" | cut -d: -f6)"
 if [[ ! -f /etc/codex-telegram-bridge.env ]]; then
     echo "Legacy Codex bridge environment file is missing." >&2
     exit 1
@@ -21,7 +22,8 @@ chmod 0600 "$temporary_file"
 cp /etc/codex-telegram-bridge.env "$temporary_file"
 {
     printf 'BRIDGE_STATE_PATH=/var/lib/codex-telegram-bridge/state.sqlite3\n'
-    printf 'BRIDGE_UPLOAD_ROOT=/home/alex/.cache/codex-telegram-bridge/uploads\n'
+    printf 'BRIDGE_HOME=%s\n' "$agent_home"
+    printf 'BRIDGE_UPLOAD_ROOT=%s/.cache/codex-telegram-bridge/uploads\n' "$agent_home"
 } >>"$temporary_file"
 chown root:root "$temporary_file"
 mv -f "$temporary_file" /etc/telegram-agent/codex.env

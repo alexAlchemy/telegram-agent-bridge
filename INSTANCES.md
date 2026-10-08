@@ -7,7 +7,7 @@ session history, logs, and enabled-at-boot state.
 ## Install without changing the live bot
 
 ```bash
-sudo /home/alex/codex-telegram-bridge/install_instances.sh
+sudo ~/codex-telegram-bridge/install_instances.sh
 ```
 
 This installs `telegram-agent@.service` and root-owned runtime files. It does not
@@ -16,7 +16,7 @@ start, stop, enable, disable, or restart any service.
 ## Migrate the existing Codex bot
 
 ```bash
-sudo /home/alex/codex-telegram-bridge/migrate_codex_instance.sh
+sudo ~/codex-telegram-bridge/migrate_codex_instance.sh
 ```
 
 This reuses the existing Codex bot token and SQLite state, replaces the legacy
@@ -28,7 +28,7 @@ service if the template instance fails to start.
 Create a new Telegram bot with BotFather, then enter its token locally:
 
 ```bash
-sudo /home/alex/codex-telegram-bridge/configure_instance.sh grok
+sudo ~/codex-telegram-bridge/configure_instance.sh grok
 sudo systemctl enable --now telegram-agent@grok.service
 ```
 
@@ -37,16 +37,16 @@ Never paste a bot token into chat or shell command arguments.
 ## Configure the Claude Code bot
 
 The `claude` instance drives the local Claude Code CLI
-(`/home/alex/.local/bin/claude`) headlessly with `claude -p`. It uses the
+(`~/.local/bin/claude`) headlessly with `claude -p`. It uses the
 `alex` user's existing Claude Code login. It needs its own BotFather token:
 
 ```bash
-sudo /home/alex/codex-telegram-bridge/configure_instance.sh claude
+sudo ~/codex-telegram-bridge/configure_instance.sh claude
 sudo systemctl enable --now telegram-agent@claude.service
 ```
 
 Claude runs with `--permission-mode bypassPermissions`, so it has unrestricted
-tool use inside the workspace `/home/alex`. The systemd unit's confinement is the
+tool use inside the agent home directory (`BRIDGE_HOME`, default `$HOME`). The systemd unit's confinement is the
 outer boundary. Only the allowed Telegram user can reach it.
 
 ## Operate instances

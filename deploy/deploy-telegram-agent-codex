@@ -9,7 +9,16 @@ fi
 exec 9>/run/telegram-agent-deploy-codex.lock
 flock -n 9 || { echo "A Codex bridge deployment is already running." >&2; exit 1; }
 
-source_dir=/home/alex/codex-telegram-bridge
+deploy_config=/etc/telegram-agent/deploy.env
+[[ -f "$deploy_config" && "$(stat -c '%U:%G:%a' "$deploy_config")" == "root:root:600" ]] || {
+    echo "Deploy config is missing or not root-owned mode 0600: $deploy_config" >&2
+    exit 1
+}
+source_dir="$(sed -n 's/^BRIDGE_SOURCE_DIR=//p' "$deploy_config")"
+[[ "$source_dir" == /* && -d "$source_dir" ]] || {
+    echo "BRIDGE_SOURCE_DIR is missing or not an absolute directory." >&2
+    exit 1
+}
 runtime_dir=/usr/local/lib/codex-telegram-bridge
 service=telegram-agent@codex.service
 delay_seconds=30

@@ -13,7 +13,6 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadOnlyPaths=/home/alex/codex-telegram-bridge
 ReadWritePaths=/usr/local/lib/codex-telegram-bridge /run
 ProtectKernelTunables=true
 ProtectKernelModules=true

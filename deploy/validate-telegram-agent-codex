@@ -6,7 +6,7 @@ if [[ $# -ne 0 || "$(id -u)" -ne 1000 ]]; then
     exit 2
 fi
 
-source_dir=/home/alex/codex-telegram-bridge
+source_dir="$HOME/codex-telegram-bridge"
 pycache="$(mktemp -d)"
 trap 'rm -rf "$pycache"' EXIT
 export PYTHONDONTWRITEBYTECODE=1

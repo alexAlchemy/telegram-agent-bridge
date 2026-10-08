@@ -170,7 +170,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp.name)
         self.schema = root / "schema.json"
         self.schema.write_text("{}")
-        self.runner = CodexRunner("/usr/local/bin/codex", Path("/home/alex"), self.schema)
+        self.runner = CodexRunner("/usr/local/bin/codex", Path.home(), self.schema)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -190,7 +190,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     def test_mcp_is_scoped_per_invocation_without_output_schema(self):
         root = Path(self.temp.name)
         runner = CodexRunner(
-            "/usr/local/bin/codex", Path("/home/alex"), self.schema, 10,
+            "/usr/local/bin/codex", Path.home(), self.schema, 10,
             root / "payload.json", root / "bridge_payload_mcp.py",
         )
         argv = runner.build_argv(None)
@@ -205,12 +205,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     def test_environment_excludes_telegram_token(self):
         with mock.patch.dict(
             os.environ,
-            {"TELEGRAM_BOT_TOKEN": "secret", "PATH": "/usr/bin", "HOME": "/home/alex"},
+            {"TELEGRAM_BOT_TOKEN": "secret", "PATH": "/usr/bin", "HOME": str(Path.home())},
             clear=True,
         ):
             environment = self.runner._environment()
         self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
-        self.assertEqual(environment["HOME"], "/home/alex")
+        self.assertEqual(environment["HOME"], str(Path.home()))
 
     async def test_real_subprocess_jsonl_parsing(self):
         root = Path(self.temp.name)
@@ -224,7 +224,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':3,'output_tokens':2}}))\n"
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-        runner = CodexRunner(str(executable), Path("/home/alex"), self.schema, 10)
+        runner = CodexRunner(str(executable), Path.home(), self.schema, 10)
         result = await runner.run("test", None)
         self.assertTrue(result.success)
         self.assertEqual(result.reply, "hello")
@@ -252,7 +252,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 "print(json.dumps({'type':'turn.completed','usage':{}}))\n"
             )
             executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-            runner = CodexRunner(str(executable), Path("/home/alex"), self.schema, 10, root / "payload.json", root / "mcp.py")
+            runner = CodexRunner(str(executable), Path.home(), self.schema, 10, root / "payload.json", root / "mcp.py")
             result = await runner.run("test", None)
             self.assertTrue(result.success)
             self.assertEqual(result.generated_images, (image.resolve(),))
@@ -260,7 +260,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incidental_image_path_is_not_transport_metadata(self):
         reader = asyncio.StreamReader()
-        event = {"type": "item.completed", "item": {"type": "tool_call", "output": "saved to /home/alex/.codex/generated_images/example.png"}}
+        event = {"type": "item.completed", "item": {"type": "tool_call", "output": f"saved to {Path.home()}/.codex/generated_images/example.png"}}
         reader.feed_data((json.dumps(event) + "\n").encode())
         reader.feed_data((json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}) + "\n").encode())
         reader.feed_eof()
