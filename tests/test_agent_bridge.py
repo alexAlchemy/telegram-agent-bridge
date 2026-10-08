@@ -20,7 +20,14 @@ from agent_bridge import (  # noqa: E402
     register_commands,
     send_startup_notification,
 )
-from bridge import CodexResult, MAX_OUTBOUND_IMAGE_BYTES, StateDB  # noqa: E402
+from bridge import (  # noqa: E402
+    CodexResult,
+    MAX_OUTBOUND_IMAGE_BYTES,
+    StateDB,
+    classify_failure,
+    drain_stderr,
+    with_failure_hint,
+)
 
 
 class FakeTelegram:
@@ -217,6 +224,52 @@ class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list((self.root / "prompts").iterdir()), [])
 
 
+class FailureClassificationTests(unittest.IsolatedAsyncioTestCase):
+    def test_known_cli_messages_are_classified(self):
+        cases = {
+            # Captured from the real Claude Code CLI.
+            "No conversation found with session ID: 0000-1111": "session",
+            "error: unknown option '--not-a-real-flag'": "flag",
+            "Not logged in · Please run /login": "auth",
+            "Claude AI usage limit reached": "rate_limit",
+            "HTTP 429 Too Many Requests": "rate_limit",
+            "thread abc not found": "session",
+            "unexpected argument '--foo' found": "flag",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(classify_failure(text), expected)
+
+    def test_unrecognised_or_empty_text_is_not_classified(self):
+        self.assertIsNone(classify_failure("Segmentation fault"))
+        self.assertIsNone(classify_failure(""))
+        self.assertIsNone(classify_failure(None))
+
+    def test_hint_never_echoes_cli_text(self):
+        message = with_failure_hint("Claude exited with status 1", "auth")
+        self.assertIn("login", message)
+        self.assertEqual(
+            with_failure_hint("Claude exited with status 1", None),
+            "Claude exited with status 1",
+        )
+
+    async def test_drain_stderr_classifies_without_logging_content(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"private-detail Not logged in private-detail\n")
+        reader.feed_eof()
+        with self.assertLogs(level="DEBUG") as logs:
+            kind = await drain_stderr(reader, "test")
+        self.assertEqual(kind, "auth")
+        self.assertNotIn("private-detail", "\n".join(logs.output))
+
+    async def test_drain_stderr_keeps_only_a_bounded_tail(self):
+        reader = asyncio.StreamReader()
+        # The marker is far outside the retained tail, so it must not be classified.
+        reader.feed_data(b"usage limit reached\n" + b"x" * 200_000)
+        reader.feed_eof()
+        self.assertIsNone(await drain_stderr(reader, "test"))
+
+
 class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -374,6 +427,67 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(timing["cli_overhead_ms"], int)
 
 
+    async def test_failed_resume_result_is_classified_as_session(self):
+        # Shape emitted by the real CLI for `--resume <unknown id>`.
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            self._result_line(
+                is_error=True,
+                subtype="error_during_execution",
+                structured_output=None,
+                errors=["No conversation found with session ID: claude-session"],
+            )
+        )
+        reader.feed_eof()
+        result = await self.runner._read_stdout(reader)
+        self.assertFalse(result.success)
+        self.assertEqual(result.failure_kind, "session")
+        self.assertNotIn("claude-session", result.error)
+
+    async def test_plain_text_result_is_used_when_structured_output_is_invalid(self):
+        for structured in ({"reply": 7}, None):
+            with self.subTest(structured=structured):
+                reader = asyncio.StreamReader()
+                reader.feed_data(
+                    self._result_line(structured_output=structured, result="plain answer")
+                )
+                reader.feed_eof()
+                with self.assertLogs(level="WARNING"):
+                    result = await self.runner._read_stdout(reader)
+                self.assertTrue(result.success)
+                self.assertEqual(result.reply, "plain answer")
+                self.assertFalse(result.confirmation_required)
+                self.assertEqual(result.thread_id, "claude-session")
+
+    async def test_blank_plain_text_result_still_fails_closed(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(self._result_line(structured_output=None, result="  "))
+        reader.feed_eof()
+        result = await self.runner._read_stdout(reader)
+        self.assertFalse(result.success)
+        self.assertIn("invalid structured reply", result.error)
+
+    async def test_nonzero_exit_reports_stderr_category_not_content(self):
+        executable = self.root / "fake-claude-auth"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdin.read()\n"
+            "sys.stderr.write('secret-detail: Not logged in. Please run /login\\n')\n"
+            "sys.exit(1)\n"
+        )
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        runner = ClaudeRunner(
+            str(executable), Path.home(), self.schema, self.root / "prompts", 10
+        )
+        result = await runner.run("hi", None)
+        self.assertFalse(result.success)
+        self.assertEqual(result.failure_kind, "auth")
+        self.assertIn("status 1", result.error)
+        self.assertIn("login", result.error)
+        self.assertNotIn("secret-detail", result.error)
+
+
 class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -417,6 +531,83 @@ class AgentBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("total_ms", payload)
         self.assertNotIn("private question", line)
         self.assertNotIn("secret reply", line)
+
+
+    def _scripted_runner(self, results):
+        class ScriptedRunner(FakeRunner):
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, prompt, thread_id, image_path=None):
+                self.calls.append(thread_id)
+                return results[len(self.calls) - 1]
+
+        return ScriptedRunner()
+
+    async def test_unresumable_session_is_reset_and_retried_once(self):
+        self.state.set_thread(99, "dead-session")
+        runner = self._scripted_runner(
+            [
+                CodexResult(False, "", error="exited", failure_kind="session"),
+                CodexResult(True, "fresh answer", thread_id="new-session"),
+            ]
+        )
+        self.bridge.runner = runner
+        with self.assertLogs(level="INFO") as logs:
+            await self.bridge.process_turn(99, {"text": "hello"}, False)
+        self.assertEqual(runner.calls, ["dead-session", None])
+        self.assertEqual(self.state.get_thread(99), "new-session")
+        sent = self.telegram.messages[-1][1]
+        self.assertIn("could not be resumed", sent)
+        self.assertIn("fresh answer", sent)
+        line = next(entry for entry in logs.output if "turn_timing" in entry)
+        self.assertTrue(json.loads(line.split("turn_timing ", 1)[1])["session_reset"])
+
+    async def test_failed_retry_leaves_the_chat_on_a_fresh_session(self):
+        self.state.set_thread(99, "dead-session")
+        runner = self._scripted_runner(
+            [
+                CodexResult(False, "", error="exited", failure_kind="session"),
+                CodexResult(False, "", error="exited again", failure_kind="auth"),
+            ]
+        )
+        self.bridge.runner = runner
+        await self.bridge.process_turn(99, {"text": "hello"}, False)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIsNone(self.state.get_thread(99))
+        self.assertIn("could not complete", self.telegram.messages[-1][1])
+
+    async def test_other_failures_keep_the_session_and_do_not_retry(self):
+        for kind in ("auth", "rate_limit", "flag", None):
+            with self.subTest(kind=kind):
+                self.state.set_thread(99, "live-session")
+                runner = self._scripted_runner(
+                    [CodexResult(False, "", error="exited", failure_kind=kind)]
+                )
+                self.bridge.runner = runner
+                await self.bridge.process_turn(99, {"text": "hello"}, False)
+                self.assertEqual(runner.calls, ["live-session"])
+                self.assertEqual(self.state.get_thread(99), "live-session")
+
+    async def test_session_failure_without_a_saved_session_is_not_retried(self):
+        runner = self._scripted_runner(
+            [CodexResult(False, "", error="exited", failure_kind="session")]
+        )
+        self.bridge.runner = runner
+        await self.bridge.process_turn(99, {"text": "hello"}, False)
+        self.assertEqual(runner.calls, [None])
+
+    async def test_failure_kind_is_recorded_in_turn_timing(self):
+        runner = self._scripted_runner(
+            [CodexResult(False, "", error="exited", failure_kind="rate_limit")]
+        )
+        self.bridge.runner = runner
+        with self.assertLogs(level="INFO") as logs:
+            await self.bridge.process_turn(99, {"text": "hello"}, False)
+        line = next(entry for entry in logs.output if "turn_timing" in entry)
+        self.assertEqual(
+            json.loads(line.split("turn_timing ", 1)[1])["failure_kind"], "rate_limit"
+        )
 
 
 class ConfigTests(unittest.TestCase):
