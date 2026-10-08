@@ -335,6 +335,58 @@ def parse_structured_reply(structured: Any) -> tuple[str, bool, str | None] | No
     return reply, confirmation_required, confirmation_summary
 
 
+# Write-capable MCP tools removed from the Claude instance, so Telegram turns can read
+# connected apps but cannot send, edit, delete, share or start external changes.
+# Reads stay available. Tool names come from the claude.ai connectors and the cookbook.
+CLAUDE_DENIED_TOOLS = (
+    # Gmail
+    *(f"mcp__claude_ai_Gmail__{name}" for name in (
+        "apply_sensitive_message_label", "apply_sensitive_thread_label", "create_draft",
+        "create_label", "delete_draft", "delete_label", "forward", "label_message",
+        "label_thread", "mark_message_spam", "mark_thread_spam", "reply", "send_message",
+        "trash_message", "trash_thread", "unlabel_message", "unlabel_thread",
+        "unmark_message_spam", "unmark_thread_spam", "untrash_message", "untrash_thread",
+        "update_draft", "update_label", "update_message_labels",
+    )),
+    # Google Calendar
+    *(f"mcp__claude_ai_Google_Calendar__{name}" for name in (
+        "create_event", "delete_event", "respond_to_event", "update_event",
+    )),
+    # Notion
+    *(f"mcp__claude_ai_Notion__{name}" for name in (
+        "notion-convert-page-to-skill", "notion-create-attachment", "notion-create-comment",
+        "notion-create-database", "notion-create-file-upload", "notion-create-folder",
+        "notion-create-pages", "notion-create-view", "notion-duplicate-page",
+        "notion-move-pages", "notion-restore-pages", "notion-send-message-to-session",
+        "notion-spawn-session", "notion-stop-session", "notion-update-data-source",
+        "notion-update-folder", "notion-update-page", "notion-update-view",
+        "notion-upload-skill",
+    )),
+    # Linear
+    *(f"mcp__claude_ai_Linear__{name}" for name in (
+        "create_attachment", "create_attachment_from_upload", "create_initiative_label",
+        "create_issue_label", "delete_attachment", "delete_comment", "delete_diff_comment",
+        "delete_status_update", "mark_notification", "merge_diff",
+        "prepare_attachment_upload", "resolve_diff_thread", "restore_initiative_label",
+        "restore_issue_label", "restore_project_label", "retire_initiative_label",
+        "retire_issue_label", "retire_project_label", "save_comment", "save_diff_comment",
+        "save_document", "save_initiative", "save_initiative_label", "save_issue",
+        "save_issue_label", "save_milestone", "save_project", "save_project_label",
+        "save_release", "save_release_note", "save_status_update", "share_issue",
+        "submit_diff_review", "unshare_issue", "update_diff",
+    )),
+    # Dropbox
+    *(f"mcp__claude_ai_Dropbox__{name}" for name in (
+        "copy", "create_file", "create_file_request", "create_folder",
+        "create_shared_link", "delete", "move",
+    )),
+    # Claude Docs
+    *(f"mcp__claude_ai_Claude_Docs__{name}" for name in ("batch", "create", "delete", "update")),
+    # Cloudflare: execute can run arbitrary API calls
+    "mcp__claude_ai_cloudflare__execute",
+)
+
+
 class ClaudeRunner:
     name = "claude"
 
@@ -366,7 +418,8 @@ class ClaudeRunner:
         return environment
 
     def build_argv(self, session_id: str | None) -> list[str]:
-        # The prompt arrives on stdin. Only user-level settings load, and no MCP servers.
+        # The prompt arrives on stdin. Only user-level settings load, so the user's
+        # connected MCP servers are available. Write-capable tools are denied outright.
         argv = [
             self.binary,
             "-p",
@@ -377,7 +430,8 @@ class ClaudeRunner:
             "bypassPermissions",
             "--setting-sources",
             "user",
-            "--strict-mcp-config",
+            "--disallowedTools",
+            ",".join(CLAUDE_DENIED_TOOLS),
             "--json-schema",
             self.schema_json,
             "--append-system-prompt",
