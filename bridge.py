@@ -108,6 +108,111 @@ class CodexResult:
     generated_images: tuple[Path, ...] = ()
     error: str | None = None
     timing: dict[str, Any] | None = None
+    # Coarse, content-free reason a turn failed: "session", "flag", "auth", "rate_limit".
+    failure_kind: str | None = None
+
+
+STDERR_TAIL_BYTES = 4096
+
+# Patterns are matched against a bounded tail of a CLI's stderr (or the error strings in its
+# structured output) purely to pick a category. Order matters: the first match wins.
+_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "session",
+        re.compile(
+            r"no conversation found"
+            r"|(?:session|thread|conversation)[^\n]{0,60}(?:not found|does not exist|no longer exists)"
+            r"|could not find (?:the )?(?:session|thread|conversation)"
+            r"|no such (?:session|thread|conversation)"
+            r"|(?:unable|failed) to resume",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "flag",
+        re.compile(
+            r"unknown (?:option|argument|flag)"
+            r"|unrecognized (?:option|argument|arguments|flag)"
+            r"|unexpected argument"
+            r"|invalid (?:option|flag)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "auth",
+        re.compile(
+            r"not logged in"
+            r"|log ?in (?:again|required)"
+            r"|please (?:run )?/?log ?in"
+            r"|invalid (?:api key|authentication|credentials)"
+            r"|authentication[_ ](?:error|failed|required)"
+            r"|unauthori[sz]ed"
+            r"|token (?:has )?(?:expired|been revoked)"
+            r"|oauth",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "rate_limit",
+        re.compile(
+            r"rate[ _-]?limit"
+            r"|usage limit"
+            r"|limit reached"
+            r"|hit your limit"
+            r"|too many requests"
+            r"|quota"
+            r"|\b429\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+FAILURE_HINTS = {
+    "session": "the saved session could not be resumed",
+    "flag": "the CLI rejected a command-line option; it may have been updated",
+    "auth": "the CLI login may have expired; sign in again on the server",
+    "rate_limit": "the account's usage limit may have been reached; try again later",
+}
+
+
+def classify_failure(text: str | None) -> str | None:
+    """Return a coarse failure category for CLI error text, or None if unrecognised."""
+    if not text:
+        return None
+    for kind, pattern in _FAILURE_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return None
+
+
+def with_failure_hint(message: str, kind: str | None) -> str:
+    """Append the user-safe hint for a failure category; the raw CLI text is never included."""
+    hint = FAILURE_HINTS.get(kind or "")
+    return f"{message} ({hint})" if hint else message
+
+
+def apply_failure_kind(result: "CodexResult", kind: str | None) -> "CodexResult":
+    """Attach a stderr-derived category to a failed result that has none of its own."""
+    if result.success or result.failure_kind or not kind:
+        return result
+    result.failure_kind = kind
+    result.error = with_failure_hint(result.error or "Backend failed", kind)
+    return result
+
+
+async def drain_stderr(stream: asyncio.StreamReader | None, label: str) -> str | None:
+    """Consume stderr, keeping only a bounded tail to classify. Content is never logged."""
+    if stream is None:
+        return None
+    total = 0
+    tail = b""
+    while chunk := await stream.read(64 * 1024):
+        total += len(chunk)
+        tail = (tail + chunk)[-STDERR_TAIL_BYTES:]
+    kind = classify_failure(tail.decode("utf-8", errors="replace")) if tail else None
+    if total:
+        logging.debug("%s stderr bytes=%d kind=%s", label, total, kind or "none")
+    return kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,14 +611,18 @@ class CodexRunner:
                 return CodexResult(False, "", error="Codex turn timed out")
 
             parsed = await stdout_task
-            await stderr_task
+            stderr_kind = await stderr_task
             return_code = self.process.returncode
             if return_code != 0:
                 return CodexResult(
-                    False, "", thread_id=parsed.thread_id, error=f"Codex exited with status {return_code}"
+                    False,
+                    "",
+                    thread_id=parsed.thread_id,
+                    error=with_failure_hint(f"Codex exited with status {return_code}", stderr_kind),
+                    failure_kind=stderr_kind,
                 )
             if not parsed.success:
-                return parsed
+                return apply_failure_kind(parsed, stderr_kind)
             if self.payload_file and turn_id:
                 try:
                     images, required, summary = consume_bridge_payload(self.payload_file, turn_id)
@@ -568,14 +677,8 @@ class CodexRunner:
         reply, required, summary = normalize_legacy_codex_reply(final_text)
         return CodexResult(True, reply, thread_id=thread_id, confirmation_required=required, confirmation_summary=summary, usage=usage)
 
-    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> None:
-        if stream is None:
-            return
-        total = 0
-        while chunk := await stream.read(64 * 1024):
-            total += len(chunk)
-        if total:
-            logging.debug("codex stderr bytes=%d", total)
+    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> str | None:
+        return await drain_stderr(stream, "codex")
 
 
 class Bridge:

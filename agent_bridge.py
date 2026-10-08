@@ -35,11 +35,15 @@ from bridge import (
     StateDB,
     TelegramClient,
     TelegramError,
+    apply_failure_kind,
     bridge_home,
+    classify_failure,
     cleanup_upload_root,
+    drain_stderr,
     iter_subprocess_lines,
     configure_logging,
     get_attachment,
+    with_failure_hint,
 )
 
 
@@ -215,15 +219,18 @@ class GrokRunner:
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
                 return BackendResult(False, "", error="Grok turn timed out")
             parsed = await stdout_task
-            await stderr_task
+            stderr_kind = await stderr_task
             if self.process.returncode != 0:
                 return BackendResult(
                     False,
                     "",
                     thread_id=parsed.thread_id,
-                    error=f"Grok exited with status {self.process.returncode}",
+                    error=with_failure_hint(
+                        f"Grok exited with status {self.process.returncode}", stderr_kind
+                    ),
+                    failure_kind=stderr_kind,
                 )
-            return parsed
+            return apply_failure_kind(parsed, stderr_kind)
         except FileNotFoundError:
             return BackendResult(False, "", error="Grok executable was not found")
         except OSError as exc:
@@ -305,14 +312,8 @@ class GrokRunner:
             generated_images=tuple(generated_images),
         )
 
-    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> None:
-        if stream is None:
-            return
-        total = 0
-        while chunk := await stream.read(64 * 1024):
-            total += len(chunk)
-        if total:
-            logging.debug("grok stderr bytes=%d", total)
+    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> str | None:
+        return await drain_stderr(stream, "grok")
 
 
 def parse_structured_reply(structured: Any) -> tuple[str, bool, str | None] | None:
@@ -439,16 +440,21 @@ class ClaudeRunner:
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
                 return BackendResult(False, "", error="Claude turn timed out")
             parsed = await stdout_task
-            await stderr_task
+            stderr_kind = await stderr_task
             parsed.timing = self._timing(run_started, spawned, marks)
             if self.process.returncode != 0:
+                # Claude also reports the reason in its result event, so prefer that category.
+                kind = parsed.failure_kind or stderr_kind
                 return BackendResult(
                     False,
                     "",
                     thread_id=parsed.thread_id,
-                    error=f"Claude exited with status {self.process.returncode}",
+                    error=with_failure_hint(
+                        f"Claude exited with status {self.process.returncode}", kind
+                    ),
+                    failure_kind=kind,
                 )
-            return parsed
+            return apply_failure_kind(parsed, stderr_kind)
         except FileNotFoundError:
             return BackendResult(False, "", error="Claude executable was not found")
         except OSError as exc:
@@ -519,11 +525,25 @@ class ClaudeRunner:
         if isinstance(final.get("session_id"), str):
             session_id = final["session_id"]
         if final.get("is_error") or final.get("subtype") != "success":
+            kind = self._failure_kind(final)
             return BackendResult(
-                False, "", thread_id=session_id, error="Claude reported a failed turn"
+                False,
+                "",
+                thread_id=session_id,
+                error=with_failure_hint("Claude reported a failed turn", kind),
+                failure_kind=kind,
             )
         fields = parse_structured_reply(final.get("structured_output"))
         if fields is None:
+            # The turn itself succeeded, so its work is done. Deliver the plain-text result
+            # rather than discarding it; the confirmation flag cannot be recovered here.
+            text = final.get("result")
+            if isinstance(text, str) and text.strip():
+                logging.warning(
+                    "claude structured output missing or invalid; using plain-text result"
+                )
+                usage = final.get("usage") if isinstance(final.get("usage"), dict) else None
+                return BackendResult(True, text, thread_id=session_id, usage=usage)
             return BackendResult(
                 False,
                 "",
@@ -541,14 +561,20 @@ class ClaudeRunner:
             usage=usage,
         )
 
-    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> None:
-        if stream is None:
-            return
-        total = 0
-        while chunk := await stream.read(64 * 1024):
-            total += len(chunk)
-        if total:
-            logging.debug("claude stderr bytes=%d", total)
+    @staticmethod
+    def _failure_kind(final: dict[str, Any]) -> str | None:
+        """Classify a failed result event from its error strings. Nothing is logged or shown."""
+        parts: list[str] = []
+        errors = final.get("errors")
+        if isinstance(errors, list):
+            parts.extend(item for item in errors if isinstance(item, str))
+        text = final.get("result")
+        if isinstance(text, str):
+            parts.append(text[:500])
+        return classify_failure(" ".join(parts))
+
+    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> str | None:
+        return await drain_stderr(stream, "claude")
 
 
 class AgentBridge(Bridge):
@@ -626,19 +652,34 @@ class AgentBridge(Bridge):
             timing["attachment"] = attachment is not None
             timing["prep_ms"] = round((time.monotonic() - started) * 1000)
             runner_started = time.monotonic()
-            result = await self.runner.run(
-                prompt, self.state.get_thread(chat_id), image_path
-            )
+            previous_thread = self.state.get_thread(chat_id)
+            result = await self.runner.run(prompt, previous_thread, image_path)
+            session_reset = False
+            if previous_thread and not result.success and result.failure_kind == "session":
+                # The CLI no longer knows this session (pruned, or invalidated by an upgrade).
+                # It refused before doing any work, so start over once rather than leave the
+                # chat stuck failing on the same dead session until /new.
+                logging.warning(
+                    "%s session could not be resumed; retrying with a fresh session",
+                    self.backend_name,
+                )
+                self.state.set_thread(chat_id, None)
+                session_reset = True
+                timing["session_reset"] = True
+                result = await self.runner.run(prompt, None, image_path)
             timing["runner_ms"] = round((time.monotonic() - runner_started) * 1000)
             timing.update(result.timing or {})
             duration = time.monotonic() - started
             if not result.success:
                 logging.warning(
-                    "%s turn failed duration=%.1fs error=%s",
+                    "%s turn failed duration=%.1fs kind=%s error=%s",
                     self.backend_name,
                     duration,
+                    result.failure_kind or "unknown",
                     result.error,
                 )
+                if result.failure_kind:
+                    timing["failure_kind"] = result.failure_kind
                 await self.telegram.send_message(
                     chat_id,
                     f"{self.backend_title} could not complete that turn: {result.error}",
@@ -659,6 +700,11 @@ class AgentBridge(Bridge):
                 if confirmation_turn:
                     self.state.set_pending_confirmation(chat_id, None)
                 reply = result.reply
+            if session_reset:
+                reply = (
+                    f"(The previous {self.backend_title} session could not be resumed, "
+                    f"so this started a new one.)\n\n{reply}"
+                ).rstrip()
             usage = result.usage or {}
             logging.info(
                 "%s turn complete duration=%.1fs input_tokens=%s output_tokens=%s",

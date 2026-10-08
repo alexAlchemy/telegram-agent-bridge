@@ -15,6 +15,7 @@ This project is intentionally opinionated for a single-user VPS. It uses Telegra
 - Process-group cancellation, typing indicators, retry backoff, and sanitized logs.
 - Ordinary Codex final messages remain plain text; transport metadata is kept out of the reply. Legacy resumed sessions are narrowly unwrapped from the former bridge schema.
 - Each backend sends a best-effort `<Backend> bridge is online.` message after successful startup.
+- Failure handling: failed turns report a coarse reason (expired login, usage limit, rejected CLI option, unresumable session) without exposing CLI output. An unresumable session is reset and retried once, and Claude replies fall back to the plain-text result if structured output is invalid.
 - Python standard library only.
 
 ## Architecture
