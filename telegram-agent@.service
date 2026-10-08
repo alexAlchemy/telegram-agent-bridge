@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 User=alex
 Group=alex
-WorkingDirectory=/home/alex
-Environment=HOME=/home/alex
+WorkingDirectory=%h
+Environment=HOME=%h
 Environment=USER=alex
 Environment=LOGNAME=alex
-Environment=PATH=/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/telegram-agent/%i.env
 ExecStart=/usr/bin/python3 /usr/local/lib/codex-telegram-bridge/agent_bridge.py --backend %i
 Restart=on-failure
@@ -25,7 +25,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/alex /var/lib/telegram-agent/%i /var/lib/codex-telegram-bridge
+ReadWritePaths=%h /var/lib/telegram-agent/%i /var/lib/codex-telegram-bridge
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

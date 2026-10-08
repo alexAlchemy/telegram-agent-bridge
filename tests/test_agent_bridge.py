@@ -39,7 +39,7 @@ class FakeTelegram:
 
 
 class FakeRunner:
-    workspace = Path("/home/alex/code/telegram-narrator")
+    workspace = Path.home() / "code" / "telegram-narrator"
 
     async def cancel(self):
         return False
@@ -86,8 +86,8 @@ class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.runner = GrokRunner(
-            "/home/alex/.local/bin/grok",
-            Path("/home/alex"),
+            str(Path.home() / ".local" / "bin" / "grok"),
+            Path.home(),
             self.schema,
             self.root / "prompts",
             timeout_seconds=10,
@@ -113,7 +113,7 @@ class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "TELEGRAM_BOT_TOKEN": "telegram-secret",
                 "XAI_API_KEY": "provider-secret",
-                "HOME": "/home/alex",
+                "HOME": str(Path.home()),
                 "PATH": "/usr/bin",
             },
             clear=True,
@@ -209,7 +209,7 @@ class GrokRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
         runner = GrokRunner(
-            str(executable), Path("/home/alex"), self.schema, self.root / "prompts", 10
+            str(executable), Path.home(), self.schema, self.root / "prompts", 10
         )
         result = await runner.run("secret prompt text", None)
         self.assertTrue(result.success)
@@ -241,8 +241,8 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.runner = ClaudeRunner(
-            "/home/alex/.local/bin/claude",
-            Path("/home/alex"),
+            str(Path.home() / ".local" / "bin" / "claude"),
+            Path.home(),
             self.schema,
             self.root / "prompts",
             timeout_seconds=10,
@@ -284,7 +284,7 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "TELEGRAM_BOT_TOKEN": "telegram-secret",
                 "ANTHROPIC_API_KEY": "provider-secret",
-                "HOME": "/home/alex",
+                "HOME": str(Path.home()),
                 "PATH": "/usr/bin",
             },
             clear=True,
@@ -292,7 +292,7 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
             environment = self.runner._environment()
         self.assertNotIn("TELEGRAM_BOT_TOKEN", environment)
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
-        self.assertEqual(environment["HOME"], "/home/alex")
+        self.assertEqual(environment["HOME"], str(Path.home()))
 
     async def test_result_event_is_normalized(self):
         reader = asyncio.StreamReader()
@@ -338,7 +338,7 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
         runner = ClaudeRunner(
-            str(executable), Path("/home/alex"), self.schema, self.root / "prompts", 10
+            str(executable), Path.home(), self.schema, self.root / "prompts", 10
         )
         result = await runner.run("secret prompt text", None)
         self.assertTrue(result.success)
@@ -360,7 +360,7 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
         runner = ClaudeRunner(
-            str(executable), Path("/home/alex"), self.schema, self.root / "prompts", 10
+            str(executable), Path.home(), self.schema, self.root / "prompts", 10
         )
         result = await runner.run("hi", None)
         self.assertTrue(result.success)
@@ -430,7 +430,7 @@ class ConfigTests(unittest.TestCase):
     def test_backend_specific_default_paths(self):
         with mock.patch.dict(
             os.environ,
-            {"TELEGRAM_BOT_TOKEN": "not-logged", "TELEGRAM_ALLOWED_USER_ID": "123456789", "HOME": "/home/alex"},
+            {"TELEGRAM_BOT_TOKEN": "not-logged", "TELEGRAM_ALLOWED_USER_ID": "123456789", "HOME": str(Path.home())},
             clear=True,
         ):
             config = load_instance_config("grok")
@@ -438,7 +438,22 @@ class ConfigTests(unittest.TestCase):
             config["state_path"], Path("/var/lib/telegram-agent/grok/state.sqlite3")
         )
         self.assertEqual(
-            config["workspace"], Path("/home/alex/code/telegram-narrator")
+            config["workspace"], Path.home() / "code" / "telegram-narrator"
+        )
+
+    def test_bridge_home_overrides_default_workspace(self):
+        with tempfile.TemporaryDirectory() as home:
+            base = {
+                "TELEGRAM_BOT_TOKEN": "not-logged",
+                "TELEGRAM_ALLOWED_USER_ID": "123456789",
+                "BRIDGE_HOME": home,
+            }
+            with mock.patch.dict(os.environ, base, clear=True):
+                codex = load_instance_config("codex")
+                grok = load_instance_config("grok")
+        self.assertEqual(codex["workspace"], Path(home).resolve())
+        self.assertEqual(
+            grok["workspace"], Path(home).resolve() / "code" / "telegram-narrator"
         )
 
     def test_backend_workspaces_are_fixed(self):
@@ -447,13 +462,13 @@ class ConfigTests(unittest.TestCase):
             "TELEGRAM_ALLOWED_USER_ID": "123456789",
         }
         with mock.patch.dict(
-            os.environ, {**base, "AGENT_WORKSPACE": "/home/alex"}, clear=True
+            os.environ, {**base, "AGENT_WORKSPACE": str(Path.home())}, clear=True
         ):
             with self.assertRaisesRegex(SystemExit, "for grok"):
                 load_instance_config("grok")
         with mock.patch.dict(
             os.environ,
-            {**base, "AGENT_WORKSPACE": "/home/alex/code/telegram-narrator"},
+            {**base, "AGENT_WORKSPACE": str(Path.home() / "code" / "telegram-narrator")},
             clear=True,
         ):
             with self.assertRaisesRegex(SystemExit, "for codex"):

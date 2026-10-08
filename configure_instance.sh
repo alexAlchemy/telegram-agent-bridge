@@ -11,6 +11,8 @@ if [[ $# -ne 1 || ! "$1" =~ ^(codex|grok|claude)$ ]]; then
 fi
 
 instance="$1"
+agent_home="$(getent passwd "${SUDO_USER:-alex}" | cut -d: -f6)"
+: "${agent_home:?cannot resolve the agent home directory}"
 read -r -s -p "Enter the BotFather token for the $instance bot: " token </dev/tty
 echo >/dev/tty
 read -r -p "Enter the allowed Telegram user ID: " allowed_user_id </dev/tty
@@ -33,6 +35,7 @@ chmod 0600 "$temporary_file"
     printf 'TELEGRAM_ALLOWED_USER_ID=%s\n' "$allowed_user_id"
     printf 'AGENT_TIMEOUT_SECONDS=1800\n'
     printf 'LOG_LEVEL=INFO\n'
+    printf 'BRIDGE_HOME=%s\n' "$agent_home"
 } >"$temporary_file"
 chown root:root "$temporary_file"
 mv -f "$temporary_file" "$environment_file"

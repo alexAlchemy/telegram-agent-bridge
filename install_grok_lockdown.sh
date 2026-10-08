@@ -2,16 +2,17 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Run with sudo: sudo /home/alex/codex-telegram-bridge/install_grok_lockdown.sh" >&2
+    echo "Run with sudo: sudo $0" >&2
     exit 1
 fi
 
-source_dir=/home/alex/codex-telegram-bridge
+source_dir="$(cd "$(dirname "$0")" && pwd)"
+agent_home="$(getent passwd "${SUDO_USER:-alex}" | cut -d: -f6)"
 dropin_dir=/etc/systemd/system/telegram-agent@grok.service.d
 
 /usr/bin/test -f "$source_dir/agent_bridge.py"
 /usr/bin/test -f "$source_dir/deploy/telegram-agent-grok-lockdown.conf"
-/usr/bin/test -d /home/alex/code/telegram-narrator
+/usr/bin/test -d "$agent_home/code/telegram-narrator"
 /usr/bin/python3 -m py_compile "$source_dir/agent_bridge.py"
 
 /usr/bin/install -o root -g root -m 0755 \

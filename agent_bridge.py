@@ -35,6 +35,7 @@ from bridge import (
     StateDB,
     TelegramClient,
     TelegramError,
+    bridge_home,
     cleanup_upload_root,
     iter_subprocess_lines,
     configure_logging,
@@ -42,9 +43,9 @@ from bridge import (
 )
 
 
-GROK_SESSION_ROOT = Path.home() / ".grok" / "sessions"
+GROK_SESSION_ROOT = bridge_home() / ".grok" / "sessions"
 GROK_ABSOLUTE_IMAGE_PATTERN = re.compile(
-    r"(?P<path>/home/alex/\.grok/sessions/[^\s\]\[()<>]+/"
+    r"(?P<path>" + re.escape(str(GROK_SESSION_ROOT)) + r"/[^\s\]\[()<>]+/"
     r"[^\s\]\[()<>]+/images/[^\s\]\[()<>]+\.(?:png|jpe?g|webp))",
     re.IGNORECASE,
 )
@@ -74,7 +75,7 @@ def extract_grok_image_paths(
                 collect(nested)
 
     session_root = session_root or GROK_SESSION_ROOT
-    workspace_key = workspace_key or quote("/home/alex/code/telegram-narrator", safe="")
+    workspace_key = workspace_key or quote(str(bridge_home() / "code" / "telegram-narrator"), safe="")
     collect(value)
     candidates: list[Path] = []
     for string in strings:
@@ -135,11 +136,11 @@ class GrokRunner:
 
     def _environment(self) -> dict[str, str]:
         environment = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
-        environment.setdefault("HOME", "/home/alex")
+        environment.setdefault("HOME", str(Path.home()))
         environment.setdefault("USER", "alex")
         environment.setdefault("LOGNAME", "alex")
         environment.setdefault(
-            "PATH", "/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin"
+            "PATH", f"{Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin"
         )
         return environment
 
@@ -355,11 +356,11 @@ class ClaudeRunner:
 
     def _environment(self) -> dict[str, str]:
         environment = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
-        environment.setdefault("HOME", "/home/alex")
+        environment.setdefault("HOME", str(Path.home()))
         environment.setdefault("USER", "alex")
         environment.setdefault("LOGNAME", "alex")
         environment.setdefault(
-            "PATH", "/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin"
+            "PATH", f"{Path.home()}/.local/bin:/usr/local/bin:/usr/bin:/bin"
         )
         return environment
 
@@ -705,7 +706,7 @@ class AgentBridge(Bridge):
         return (
             f"This bot uses the {self.backend_title} backend. Send text, a photo, or a "
             "document up to 20 MB. It can chat, search the web, inspect files, and work "
-            "inside /home/alex.\n\n"
+            "inside the agent home directory.\n\n"
             f"/new — start a fresh {self.backend_title} session\n"
             "/status — show backend and session status\n"
             "/peek — show progress or the latest turn result\n"
@@ -748,9 +749,9 @@ def load_instance_config(backend: str) -> dict[str, Any]:
         raise SystemExit("Numeric bridge configuration is invalid") from exc
     base_dir = Path(__file__).resolve().parent
     expected_workspace = (
-        Path("/home/alex/code/telegram-narrator")
+        bridge_home() / "code" / "telegram-narrator"
         if backend == "grok"
-        else Path("/home/alex")
+        else bridge_home()
     )
     workspace = Path(
         os.environ.get("AGENT_WORKSPACE", str(expected_workspace))
@@ -776,13 +777,13 @@ def load_instance_config(backend: str) -> dict[str, Any]:
         "upload_root": Path(
             os.environ.get(
                 "BRIDGE_UPLOAD_ROOT",
-                f"/home/alex/.cache/telegram-agent-bridge/{backend}/uploads",
+                f"{Path.home()}/.cache/telegram-agent-bridge/{backend}/uploads",
             )
         ).resolve(),
         "timeout_seconds": timeout_seconds,
         "codex_binary": os.environ.get("CODEX_BINARY", "/usr/local/bin/codex"),
-        "grok_binary": os.environ.get("GROK_BINARY", "/home/alex/.local/bin/grok"),
-        "claude_binary": os.environ.get("CLAUDE_BINARY", "/home/alex/.local/bin/claude"),
+        "grok_binary": os.environ.get("GROK_BINARY", str(Path.home() / ".local" / "bin" / "grok")),
+        "claude_binary": os.environ.get("CLAUDE_BINARY", str(Path.home() / ".local" / "bin" / "claude")),
         "grok_max_turns": grok_max_turns,
         "cache_recycle_bytes": cache_recycle_bytes if backend == "codex" else 0,
         "cache_recycle_min_uptime_seconds": cache_recycle_min_uptime_seconds,

@@ -2,7 +2,7 @@
 
 A dependency-free Python bridge connecting private Telegram bots to local Codex, Grok, and Claude Code CLI sessions. A hardened systemd template runs separate `codex`, `grok`, and `claude` instances, each with its own bot token, session state, uploads, logs, and lifecycle.
 
-This project is intentionally opinionated for a single-user VPS. It uses Telegram long polling, exposes no listener or public port, and fixes the agent workspace at `/home/alex`.
+This project is intentionally opinionated for a single-user VPS. It uses Telegram long polling, exposes no listener or public port, and fixes the agent workspace at the agent home directory (`BRIDGE_HOME`, default `$HOME`).
 
 ## Features
 
@@ -42,7 +42,7 @@ The instances share root-owned runtime files under `/usr/local/lib/codex-telegra
 - Telegram tokens are removed from agent subprocess environments.
 - Codex uses workspace-write sandboxing and non-interactive approvals.
 - Grok uses workspace confinement, no subagents, and the approved non-interactive profile.
-- Claude Code runs with `--permission-mode bypassPermissions`, which allows all of its tools inside `/home/alex`. The systemd unit is the outer boundary. Prompt rules and the `/confirm` flow guard external mutations. The instance loads only user-level settings (`--setting-sources user`) and no MCP servers (`--strict-mcp-config`). Its subprocess environment excludes API keys and the Telegram token, so it uses the `alex` user's Claude login.
+- Claude Code runs with `--permission-mode bypassPermissions`, which allows all of its tools inside the agent home directory (`BRIDGE_HOME`, default `$HOME`). The systemd unit is the outer boundary. Prompt rules and the `/confirm` flow guard external mutations. The instance loads only user-level settings (`--setting-sources user`) and no MCP servers (`--strict-mcp-config`). Its subprocess environment excludes API keys and the Telegram token, so it uses the `alex` user's Claude login.
 - Attachments are never automatically extracted or executed and are removed after each turn.
 - Generated files must resolve beneath backend-specific trusted roots and are capped at 10 MB.
 - Prompts, replies, credentials, uploaded contents, and raw backend stderr are not logged.
@@ -113,6 +113,8 @@ A one-time privileged bootstrap installs a root-owned, no-argument deploy helper
 ```bash
 sudo ./install_deploy_gate.sh
 ```
+
+The bootstrap records the repository location in `/etc/telegram-agent/deploy.env` (root-owned, mode 0600). The root helper reads that file, so the path is not hardcoded in the helper.
 
 After bootstrap, an agent running as `alex` can validate, snapshot, deploy, and schedule a delayed Codex-only restart without sudo:
 
