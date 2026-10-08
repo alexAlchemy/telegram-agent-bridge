@@ -325,11 +325,22 @@ class ClaudeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-p", argv)
         self.assertIn("stream-json", argv)
         self.assertIn("bypassPermissions", argv)
-        self.assertIn("--strict-mcp-config", argv)
+        self.assertNotIn("--strict-mcp-config", argv)
+        self.assertNotIn("--mcp-config", argv)
         self.assertNotIn("--resume", argv)
         self.assertNotIn("--max-turns", argv)
         resumed = self.runner.build_argv("claude-session")
         self.assertEqual(resumed[resumed.index("--resume") + 1], "claude-session")
+
+    def test_argv_denies_write_tools_but_keeps_reads(self):
+        argv = self.runner.build_argv(None)
+        denied = argv[argv.index("--disallowedTools") + 1].split(",")
+        self.assertIn("mcp__claude_ai_Gmail__send_message", denied)
+        self.assertIn("mcp__claude_ai_Google_Calendar__create_event", denied)
+        self.assertIn("mcp__claude_ai_cloudflare__execute", denied)
+        self.assertNotIn("mcp__claude_ai_Gmail__search_threads", denied)
+        self.assertNotIn("mcp__aphebis-cookbook__list_capabilities", denied)
+        self.assertEqual(len(denied), len(set(denied)))
 
     def test_environment_excludes_bot_and_provider_secrets(self):
         with mock.patch.dict(

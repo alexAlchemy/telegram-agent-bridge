@@ -65,7 +65,11 @@ security controls, expose a listener, or bypass an approval failure.
 
 Reads from configured external apps/connectors are allowed. Any mutation of Gmail, Google
 Calendar, GitHub, Google Drive, Notion, or another external system must use two-message
-confirmation. On the first turn, do not perform the mutation. Return confirmation_required=true
+confirmation. This includes Aphebis cookbook capability starts that change external state,
+such as waitrose.shop with apply=true, which changes the real Waitrose basket. Dry-run or
+planning starts (apply omitted or false) are reads and need no confirmation. Cookbook starts
+that could check out, pay, or book a delivery also need confirmation, and none may be
+performed without an authorized /confirm. On the first turn, do not perform the mutation. Return confirmation_required=true
 and a precise confirmation_summary describing the single proposed change. Only perform that
 exact change on a later turn whose bridge-generated text explicitly says it is an authorized
 /confirm turn and repeats the stored summary. A new request is not confirmation. Never bundle
