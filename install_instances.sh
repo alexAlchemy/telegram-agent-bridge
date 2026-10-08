@@ -19,6 +19,7 @@ INSTALL_DIR=/usr/local/lib/codex-telegram-bridge
 /usr/bin/install -d -o root -g root -m 0755 /var/lib/telegram-agent
 /usr/bin/install -d -o alex -g alex -m 0700 /var/lib/telegram-agent/codex
 /usr/bin/install -d -o alex -g alex -m 0700 /var/lib/telegram-agent/grok
+/usr/bin/install -d -o alex -g alex -m 0700 /var/lib/telegram-agent/claude
 /usr/bin/install -o root -g root -m 0644 \
     "$SOURCE_DIR/telegram-agent@.service" \
     /etc/systemd/system/telegram-agent@.service

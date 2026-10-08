@@ -1,12 +1,12 @@
 # Telegram Agent Bridge
 
-A dependency-free Python bridge connecting private Telegram bots to local Codex and Grok CLI sessions. A hardened systemd template runs separate `codex` and `grok` instances, each with its own bot token, session state, uploads, logs, and lifecycle.
+A dependency-free Python bridge connecting private Telegram bots to local Codex, Grok, and Claude Code CLI sessions. A hardened systemd template runs separate `codex`, `grok`, and `claude` instances, each with its own bot token, session state, uploads, logs, and lifecycle.
 
 This project is intentionally opinionated for a single-user VPS. It uses Telegram long polling, exposes no listener or public port, and fixes the agent workspace at `/home/alex`.
 
 ## Features
 
-- Independent Codex and Grok Telegram bots from one codebase.
+- Independent Codex, Grok, and Claude Code Telegram bots from one codebase.
 - Private-chat allowlist configured by the required `TELEGRAM_ALLOWED_USER_ID` environment variable.
 - Resumable backend sessions with per-instance SQLite metadata.
 - Text, photo, and document input up to 20 MB.
@@ -20,16 +20,18 @@ This project is intentionally opinionated for a single-user VPS. It uses Telegra
 ## Architecture
 
 ```text
-Telegram Bot API                   Telegram Bot API
-       |                                  |
-telegram-agent@codex.service       telegram-agent@grok.service
-       |                                  |
-   Codex CLI                           Grok CLI
-       |                                  |
-SQLite state and uploads           SQLite state and uploads
+Telegram Bot API         Telegram Bot API         Telegram Bot API
+       |                        |                        |
+telegram-agent@codex   telegram-agent@grok   telegram-agent@claude
+       |                        |                        |
+   Codex CLI                Grok CLI              Claude Code CLI (claude -p)
+       |                        |                        |
+SQLite state and uploads  (same)                   (same)
 ```
 
 For Codex turns, the bridge launches the bundled `bridge_payload_mcp.py` server over stdio. The tool atomically replaces one turn-tagged `payload.json`; after Codex exits, the bridge validates and consumes it once. Image paths never depend on scraping tool output or final-message JSON.
+
+The Claude instance runs `claude -p --output-format stream-json`, sends the prompt on stdin, and reads the structured reply from the final `result` event. It resumes sessions with `--resume <session_id>`.
 
 The instances share root-owned runtime files under `/usr/local/lib/codex-telegram-bridge` but use separate environment files, databases, upload paths, CLI sessions, and Telegram tokens.
 
@@ -40,6 +42,7 @@ The instances share root-owned runtime files under `/usr/local/lib/codex-telegra
 - Telegram tokens are removed from agent subprocess environments.
 - Codex uses workspace-write sandboxing and non-interactive approvals.
 - Grok uses workspace confinement, no subagents, and the approved non-interactive profile.
+- Claude Code runs with `--permission-mode bypassPermissions`, which allows all of its tools inside `/home/alex`. The systemd unit is the outer boundary. Prompt rules and the `/confirm` flow guard external mutations. The instance loads only user-level settings (`--setting-sources user`) and no MCP servers (`--strict-mcp-config`). Its subprocess environment excludes API keys and the Telegram token, so it uses the `alex` user's Claude login.
 - Attachments are never automatically extracted or executed and are removed after each turn.
 - Generated files must resolve beneath backend-specific trusted roots and are capped at 10 MB.
 - Prompts, replies, credentials, uploaded contents, and raw backend stderr are not logged.
@@ -50,6 +53,7 @@ The instances share root-owned runtime files under `/usr/local/lib/codex-telegra
 - Linux with systemd and Python 3.12 or newer.
 - A working local Codex CLI login for the Codex instance.
 - A working local Grok CLI login for the Grok instance.
+- A working local Claude Code login (`claude` CLI, for example claude.ai) for the Claude instance. Each Claude turn draws on that account's usage limits.
 - One Telegram bot token per enabled instance.
 - Deployment paths and service user matching this VPS-oriented configuration.
 
@@ -71,6 +75,7 @@ The interactive helper validates and writes configuration locally:
 ```bash
 sudo ./configure_instance.sh codex
 sudo ./configure_instance.sh grok
+sudo ./configure_instance.sh claude
 ```
 
 ## Install
@@ -86,6 +91,7 @@ Enable an instance only after its environment and backend login are ready:
 ```bash
 sudo systemctl enable --now telegram-agent@codex.service
 sudo systemctl enable --now telegram-agent@grok.service
+sudo systemctl enable --now telegram-agent@claude.service
 ```
 
 Legacy single-instance scripts remain for migration compatibility. See `INSTANCES.md` for migration and operations.
@@ -114,7 +120,7 @@ After bootstrap, an agent running as `alex` can validate, snapshot, deploy, and 
 systemctl --no-block start telegram-agent-deploy-codex.service
 ```
 
-The helper never executes a repository installer as root and never copies user-editable unit files. It deploys only an explicit application-file allowlist, aborts if source changes during validation or staging, and restores the previous runtime if restart verification fails. Grok and Hermes are outside its scope.
+The helper never executes a repository installer as root and never copies user-editable unit files. It deploys only an explicit application-file allowlist, aborts if source changes during validation or staging, and restores the previous runtime if restart verification fails. Grok, Claude, and Hermes are outside its scope.
 
 ## Operations
 
@@ -123,6 +129,8 @@ systemctl status telegram-agent@codex.service --no-pager -l
 systemctl status telegram-agent@grok.service --no-pager -l
 journalctl -u telegram-agent@codex.service -n 120 --no-pager
 journalctl -u telegram-agent@grok.service -n 120 --no-pager
+systemctl status telegram-agent@claude.service --no-pager -l
+journalctl -u telegram-agent@claude.service -n 120 --no-pager
 ```
 
 Restart only the instance whose source, configuration, or authentication changed.

@@ -313,6 +313,199 @@ class GrokRunner:
             logging.debug("grok stderr bytes=%d", total)
 
 
+def parse_structured_reply(structured: Any) -> tuple[str, bool, str | None] | None:
+    """Return (reply, confirmation_required, confirmation_summary), or None if malformed."""
+    if not isinstance(structured, dict):
+        return None
+    try:
+        reply = structured["reply"]
+        confirmation_required = bool(structured["confirmation_required"])
+        confirmation_summary = structured.get("confirmation_summary")
+    except KeyError:
+        return None
+    if not isinstance(reply, str):
+        return None
+    if confirmation_required and not isinstance(confirmation_summary, str):
+        return None
+    if not confirmation_required:
+        confirmation_summary = None
+    return reply, confirmation_required, confirmation_summary
+
+
+class ClaudeRunner:
+    name = "claude"
+
+    def __init__(
+        self,
+        binary: str,
+        workspace: Path,
+        schema_path: Path,
+        prompt_root: Path,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.binary = binary
+        self.workspace = workspace
+        self.prompt_root = prompt_root
+        self.timeout_seconds = timeout_seconds
+        self.process: asyncio.subprocess.Process | None = None
+        self.schema_json = json.dumps(
+            json.loads(schema_path.read_text()), separators=(",", ":")
+        )
+
+    def _environment(self) -> dict[str, str]:
+        environment = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
+        environment.setdefault("HOME", "/home/alex")
+        environment.setdefault("USER", "alex")
+        environment.setdefault("LOGNAME", "alex")
+        environment.setdefault(
+            "PATH", "/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        )
+        return environment
+
+    def build_argv(self, session_id: str | None) -> list[str]:
+        # The prompt arrives on stdin. Only user-level settings load, and no MCP servers.
+        argv = [
+            self.binary,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "bypassPermissions",
+            "--setting-sources",
+            "user",
+            "--strict-mcp-config",
+            "--json-schema",
+            self.schema_json,
+            "--append-system-prompt",
+            DEVELOPER_INSTRUCTIONS,
+        ]
+        if session_id:
+            argv.extend(["--resume", session_id])
+        return argv
+
+    async def cancel(self) -> bool:
+        process = self.process
+        if process is None or process.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        return True
+
+    async def run(
+        self, prompt: str, thread_id: str | None, image_path: Path | None = None
+    ) -> BackendResult:
+        if self.process is not None and self.process.returncode is None:
+            return BackendResult(False, "", error="Claude is already running")
+        self.prompt_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, prompt_name = tempfile.mkstemp(
+            prefix="prompt-", suffix=".txt", dir=self.prompt_root
+        )
+        prompt_file = Path(prompt_name)
+        try:
+            if image_path:
+                prompt = f"{prompt}\n\nUse this referenced image as input: {image_path}"
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                output.write(prompt)
+            with prompt_file.open("rb") as stdin_stream:
+                self.process = await asyncio.create_subprocess_exec(
+                    *self.build_argv(thread_id),
+                    cwd=self.workspace,
+                    env=self._environment(),
+                    stdin=stdin_stream,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=SUBPROCESS_STREAM_LIMIT_BYTES,
+                    start_new_session=True,
+                )
+            stdout_task = asyncio.create_task(self._read_stdout(self.process.stdout))
+            stderr_task = asyncio.create_task(self._drain_stderr(self.process.stderr))
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=self.timeout_seconds)
+            except TimeoutError:
+                await self.cancel()
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                return BackendResult(False, "", error="Claude turn timed out")
+            parsed = await stdout_task
+            await stderr_task
+            if self.process.returncode != 0:
+                return BackendResult(
+                    False,
+                    "",
+                    thread_id=parsed.thread_id,
+                    error=f"Claude exited with status {self.process.returncode}",
+                )
+            return parsed
+        except FileNotFoundError:
+            return BackendResult(False, "", error="Claude executable was not found")
+        except OSError as exc:
+            logging.error("claude subprocess failure: %s", type(exc).__name__)
+            return BackendResult(False, "", error="Claude process could not be started")
+        finally:
+            self.process = None
+            with contextlib.suppress(OSError):
+                prompt_file.unlink()
+
+    async def _read_stdout(
+        self, stream: asyncio.StreamReader | None
+    ) -> BackendResult:
+        if stream is None:
+            return BackendResult(False, "", error="Claude stdout was unavailable")
+        session_id: str | None = None
+        final: dict[str, Any] | None = None
+        async for raw_line in iter_subprocess_lines(stream):
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if isinstance(event.get("session_id"), str):
+                session_id = event["session_id"]
+            if event.get("type") == "result":
+                final = event
+        if final is None:
+            return BackendResult(False, "", thread_id=session_id, error="Claude returned no result")
+        if isinstance(final.get("session_id"), str):
+            session_id = final["session_id"]
+        if final.get("is_error") or final.get("subtype") != "success":
+            return BackendResult(
+                False, "", thread_id=session_id, error="Claude reported a failed turn"
+            )
+        fields = parse_structured_reply(final.get("structured_output"))
+        if fields is None:
+            return BackendResult(
+                False,
+                "",
+                thread_id=session_id,
+                error="Claude returned an invalid structured reply",
+            )
+        reply, confirmation_required, confirmation_summary = fields
+        usage = final.get("usage") if isinstance(final.get("usage"), dict) else None
+        return BackendResult(
+            True,
+            reply,
+            thread_id=session_id,
+            confirmation_required=confirmation_required,
+            confirmation_summary=confirmation_summary,
+            usage=usage,
+        )
+
+    async def _drain_stderr(self, stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        total = 0
+        while chunk := await stream.read(64 * 1024):
+            total += len(chunk)
+        if total:
+            logging.debug("claude stderr bytes=%d", total)
+
+
 class AgentBridge(Bridge):
     def __init__(self, *args: Any, backend_name: str, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -462,7 +655,7 @@ class AgentBridge(Bridge):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("codex", "grok"), required=True)
+    parser.add_argument("--backend", choices=("codex", "grok", "claude"), required=True)
     return parser.parse_args()
 
 
@@ -492,9 +685,9 @@ def load_instance_config(backend: str) -> dict[str, Any]:
         raise SystemExit("Numeric bridge configuration is invalid") from exc
     base_dir = Path(__file__).resolve().parent
     expected_workspace = (
-        Path("/home/alex")
-        if backend == "codex"
-        else Path("/home/alex/code/telegram-narrator")
+        Path("/home/alex/code/telegram-narrator")
+        if backend == "grok"
+        else Path("/home/alex")
     )
     workspace = Path(
         os.environ.get("AGENT_WORKSPACE", str(expected_workspace))
@@ -526,6 +719,7 @@ def load_instance_config(backend: str) -> dict[str, Any]:
         "timeout_seconds": timeout_seconds,
         "codex_binary": os.environ.get("CODEX_BINARY", "/usr/local/bin/codex"),
         "grok_binary": os.environ.get("GROK_BINARY", "/home/alex/.local/bin/grok"),
+        "claude_binary": os.environ.get("CLAUDE_BINARY", "/home/alex/.local/bin/claude"),
         "grok_max_turns": grok_max_turns,
         "cache_recycle_bytes": cache_recycle_bytes if backend == "codex" else 0,
         "cache_recycle_min_uptime_seconds": cache_recycle_min_uptime_seconds,
@@ -572,6 +766,14 @@ async def async_main() -> None:
             config["timeout_seconds"],
             config["upload_root"].parent / "payload.json",
             Path(__file__).resolve().parent / "bridge_payload_mcp.py",
+        )
+    elif backend == "claude":
+        runner = ClaudeRunner(
+            config["claude_binary"],
+            config["workspace"],
+            config["schema_path"],
+            config["upload_root"].parent / "prompts",
+            config["timeout_seconds"],
         )
     else:
         runner = GrokRunner(

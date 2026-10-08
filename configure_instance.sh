@@ -5,8 +5,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
     echo "Run this helper with sudo." >&2
     exit 1
 fi
-if [[ $# -ne 1 || ! "$1" =~ ^(codex|grok)$ ]]; then
-    echo "Usage: sudo $0 codex|grok" >&2
+if [[ $# -ne 1 || ! "$1" =~ ^(codex|grok|claude)$ ]]; then
+    echo "Usage: sudo $0 codex|grok|claude" >&2
     exit 1
 fi
 
